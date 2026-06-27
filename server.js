@@ -10,6 +10,8 @@ import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import config from './config/index.js';
+import { logger, createLogger } from './utils/logger.js';
+import { requestIdMiddleware } from './utils/requestId.js';
 
 // -- Serviços internos
 import * as telegram from './services/telegram.js';
@@ -24,13 +26,13 @@ import {
   appendHistory,
   deleteSession,
   activeSessionCount,
+  destroySessionCleanup,
 } from './middleware/session.js';
 
 // =============================================================================
 // Constantes
 // =============================================================================
 
-// Callback data dos botões do menu principal
 const CALLBACK = Object.freeze({
   MENU_STATUS: 'MENU_STATUS',
   MENU_AGENDAMENTO: 'MENU_AGENDAMENTO',
@@ -40,7 +42,6 @@ const CALLBACK = Object.freeze({
   CONFIRM_CPF: 'CONFIRM_CPF',
 });
 
-// Telefone de contingência (fallback)
 const FALLBACK_PHONE = config.fallback.phone;
 
 // =============================================================================
@@ -52,27 +53,33 @@ const app = express();
 // -- Segurança básica
 app.use(helmet());
 
-// -- Rate limiting: protege o webhook contra abusos
-const webhookLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minuto
-  max: 60, // máximo 60 requisições por minuto por IP
+// -- Request ID (propagado em logs e chamadas downstream)
+app.use(requestIdMiddleware);
+
+// -- Rate limiters separados: Telegram (lax) vs Bitrix24 webhooks (restritivo)
+const telegramLimiter = rateLimit({
+  windowMs: config.rateLimit.telegramWindowMs,
+  max: config.rateLimit.telegramMax,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Muitas requisições. Aguarde um momento.' },
 });
 
+const bitrix24Limiter = rateLimit({
+  windowMs: config.rateLimit.bitrix24WindowMs,
+  max: config.rateLimit.bitrix24Max,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Rate limit excedido.' },
+});
+
 // -- Parsing do corpo da requisição (JSON)
-// O Telegram envia updates como JSON. Precisamos do corpo bruto para
-// algumas verificações, mas o express.json já resolve.
 app.use(express.json());
 
-// =============================================================================
-// Middleware de logging básico
-// =============================================================================
-
+// -- Logging básico com requestId
 app.use((req, _res, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.path}`);
+  const log = createLogger(req.requestId);
+  log.info(`${req.method} ${req.path}`);
   next();
 });
 
@@ -97,27 +104,35 @@ app.get('/health', async (_req, res) => {
 // Rota: Webhook do Telegram (ponto de entrada principal)
 // =============================================================================
 
-app.post('/webhook/telegram', webhookLimiter, async (req, res) => {
+app.post('/webhook/telegram', telegramLimiter, async (req, res) => {
+  const log = createLogger(req.requestId);
+
+  // -- Verificação do secret token (proteção contra forjamento)
+  if (!telegram.isValidWebhookSecret(req)) {
+    log.warn('Webhook Telegram rejeitado: secret token inválido.');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   // Responde imediatamente com 200 OK para o Telegram não reenviar
   res.sendStatus(200);
 
   try {
-    await handleTelegramUpdate(req.body);
+    await handleTelegramUpdate(req.body, req.requestId);
   } catch (err) {
-    console.error('[Server] Erro crítico no processamento do webhook:', err);
+    log.error(`Erro crítico no processamento do webhook: ${err.message}`, { stack: err.stack });
     // Tenta notificar o usuário sobre a falha, se possível
     try {
       const extracted = telegram.extractPayload(req.body);
       if (extracted.chatId) {
         await telegram.sendMessage(
           extracted.chatId,
-          `⚠ No momento nosso sistema de consultas está em manutenção. ` +
+          `⚠️ No momento nosso sistema de consultas está em manutenção. ` +
             `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>. ` +
             `Pedimos desculpas pelo inconveniente.`
         );
       }
     } catch (fallbackErr) {
-      console.error('[Server] Falha ao enviar mensagem de fallback:', fallbackErr.message);
+      log.error(`Falha ao enviar mensagem de fallback: ${fallbackErr.message}`);
     }
   }
 });
@@ -126,26 +141,22 @@ app.post('/webhook/telegram', webhookLimiter, async (req, res) => {
 // Rota: Webhook do Bitrix24 (eventos reversos do CRM)
 // =============================================================================
 
-app.post('/webhook/bitrix24', async (req, res) => {
+app.post('/webhook/bitrix24', bitrix24Limiter, async (req, res) => {
+  const log = createLogger(req.requestId);
   res.sendStatus(200);
 
   try {
     const event = req.body;
-    console.log('[Bitrix24 Webhook] Evento recebido:', event?.event);
+    log.info(`Evento Bitrix24 recebido: ${event?.event}`);
 
-    // Aqui podem ser tratados eventos como:
-    // - ONCRMDEALUPDATE: quando Alice atualiza um negócio, notificar cliente
-    // - ONIMOPENLINESSESSIONSTART: nova sessão de Open Channel iniciada
-    // - ONIMOPENLINESSESSIONFINISH: sessão finalizada
-
-    // Exemplo: se Alice finalizar a conversa no Open Channel,
-    // podemos notificar o cliente que o atendimento foi encerrado.
-    if (event?.event === 'ONIMOPENLINESSESSIONFINISH') {
-      // Lógica de encerramento
-      console.log('[Bitrix24] Sessão de Open Channel finalizada.');
+    if (event?.event === 'ONIMOPENLINESSESSIONSTART') {
+      // Armazenar sessionId para uso posterior em assignChatToOperator
+      log.info(`[Bitrix24] Sessão Open Channel iniciada: ${event.data?.SESSION_ID}`);
+    } else if (event?.event === 'ONIMOPENLINESSESSIONFINISH') {
+      log.info('[Bitrix24] Sessão de Open Channel finalizada.');
     }
   } catch (err) {
-    console.error('[Server] Erro ao processar webhook do Bitrix24:', err.message);
+    log.error(`Erro ao processar webhook do Bitrix24: ${err.message}`);
   }
 });
 
@@ -154,78 +165,69 @@ app.post('/webhook/bitrix24', async (req, res) => {
 // =============================================================================
 
 /**
- * Roteador principal — recebe o payload do Telegram e decide a ação
- * com base no estado atual da sessão do chat.
- *
- * @param {object} body - Corpo completo do webhook do Telegram
+ * Roteador principal — recebe o payload do Telegram e decide a ação.
+ * @param {object} body
+ * @param {string} [requestId]
  */
-async function handleTelegramUpdate(body) {
+async function handleTelegramUpdate(body, requestId) {
+  const log = createLogger(requestId);
   const extracted = telegram.extractPayload(body);
   const { chatId, text, contact, callbackData, callbackQueryId, messageId, firstName, lastName, username } = extracted;
 
   if (!chatId) {
-    console.log('[Server] Payload sem chatId — ignorado.');
+    log.info('Payload sem chatId — ignorado.');
     return;
   }
 
   const session = getSession(chatId);
 
-  // -- Registrar no histórico
   if (text) {
     appendHistory(chatId, 'user', text);
   }
 
-  // -------------------------------------------------------------------
-  // Roteamento: CALLBACK_QUERY (botão inline pressionado)
-  // -------------------------------------------------------------------
+  // -- Callback query (botão inline)
   if (callbackData && callbackQueryId) {
-    await telegram.answerCallbackQuery(callbackQueryId); // Remove loading
-    await handleCallback(chatId, callbackData, messageId, session);
+    await telegram.answerCallbackQuery(callbackQueryId);
+    await handleCallback(chatId, callbackData, messageId, session, log);
     return;
   }
 
-  // -------------------------------------------------------------------
-  // Roteamento: COMANDO /start (reinicia a conversa)
-  // -------------------------------------------------------------------
+  // -- Comando /start
   if (text === '/start') {
     await handleStart(chatId, firstName);
     return;
   }
 
-  // -------------------------------------------------------------------
-  // Roteamento: CONTATO COMPARTILHADO (botão nativo do Telegram)
-  // -------------------------------------------------------------------
+  // -- Contato compartilhado
   if (contact && contact.phone_number) {
-    await handleContactReceived(chatId, contact.phone_number, session);
+    await handleContactReceived(chatId, contact.phone_number, session, log);
     return;
   }
 
-  // -------------------------------------------------------------------
-  // Roteamento: baseado no ESTADO ATUAL da sessão
-  // -------------------------------------------------------------------
+  // -- Roteamento baseado no estado atual
   switch (session.state) {
     case State.IDLE:
       await handleIdle(chatId, text, firstName);
       break;
 
     case State.AWAITING_CPF:
-      await handleAwaitingCpf(chatId, text, firstName, session);
+      await handleAwaitingCpf(chatId, text, firstName, log);
       break;
 
     case State.AWAITING_NAME:
-      await handleAwaitingName(chatId, text, session);
+      await handleAwaitingName(chatId, text, log);
       break;
 
     case State.AUTHENTICATED:
-      await handleAuthenticated(chatId, text, session);
+      await handleAuthenticated(chatId, text, session, log);
       break;
 
     case State.AWAITING_STATUS_CPF:
-      await handleStatusLookup(chatId, text, session);
+      await handleStatusLookup(chatId, text, log);
       break;
 
     case State.AWAITING_CALLBACK_DETAILS:
-      await handleCallbackDetails(chatId, text, session);
+      await handleCallbackDetails(chatId, text, log);
       break;
 
     case State.HANDOFF:
@@ -233,7 +235,6 @@ async function handleTelegramUpdate(body) {
       break;
 
     default:
-      // Estado desconhecido — reinicia
       updateSession(chatId, State.IDLE);
       await handleIdle(chatId, text, firstName);
   }
@@ -243,12 +244,8 @@ async function handleTelegramUpdate(body) {
 // HANDLERS DE CALLBACK (botões inline)
 // =============================================================================
 
-/**
- * Processa cliques nos botões inline do menu.
- */
-async function handleCallback(chatId, callbackData, messageId, session) {
+async function handleCallback(chatId, callbackData, messageId, session, log) {
   switch (callbackData) {
-    // -- Menu Principal --
     case CALLBACK.MENU_STATUS:
       await promptForStatusCpf(chatId);
       break;
@@ -262,15 +259,15 @@ async function handleCallback(chatId, callbackData, messageId, session) {
       break;
 
     case CALLBACK.MENU_FALAR_EQUIPE:
-      await handleHandoff(chatId, session);
+      await handleHandoff(chatId, session, log);
       break;
 
     case CALLBACK.MENU_VOLTAR:
-      await showMainMenu(chatId, session);
+      await showMainMenu(chatId, getSession(chatId));
       break;
 
     default:
-      console.log(`[Server] Callback desconhecido: ${callbackData}`);
+      log.info(`Callback desconhecido: ${callbackData}`);
       await showMainMenu(chatId, session);
   }
 }
@@ -283,10 +280,6 @@ async function handleCallback(chatId, callbackData, messageId, session) {
 // FASE 1: Reconhecimento Inicial
 // ---------------------------------------------------------------------------
 
-/**
- * Estado IDLE — primeiro contato ou após /start.
- * Solicita o contato do Telegram e depois o CPF.
- */
 async function handleIdle(chatId, _text, firstName) {
   const greeting = firstName ? `Olá, ${firstName}!` : 'Olá!';
   await telegram.sendMessage(
@@ -300,13 +293,11 @@ async function handleIdle(chatId, _text, firstName) {
       `Para começar, precisamos identificar você.`
   );
 
-  // Solicita o contato do usuário (botão nativo do Telegram)
   await telegram.requestContact(
     chatId,
     '📱 Para prosseguir, por favor compartilhe seu número de telefone clicando no botão abaixo:'
   );
 
-  // Também já pergunta o CPF enquanto espera o contato
   await telegram.sendMessage(
     chatId,
     'Paralelamente, por favor informe seu <b>CPF</b> (apenas números) para consultarmos seu cadastro:'
@@ -319,36 +310,26 @@ async function handleIdle(chatId, _text, firstName) {
 // FASE 1b: Recebimento do Contato do Telegram
 // ---------------------------------------------------------------------------
 
-/**
- * Chamado quando o usuário compartilha o contato via botão nativo.
- * Armazena o telefone e avança se o CPF ainda não foi coletado.
- */
-async function handleContactReceived(chatId, phoneNumber, session) {
-  // Sanitiza e armazena
+async function handleContactReceived(chatId, phoneNumber, session, log) {
   const cleanPhone = phoneNumber.replace(/\D/g, '');
-  updateSession(chatId, session.state, { phone: cleanPhone });
+  const updated = updateSession(chatId, session.state, { phone: cleanPhone });
 
   await telegram.removeKeyboard(chatId, '✅ Número recebido! Obrigado.');
 
-  // Se já temos CPF, tenta autenticar
-  if (session.cpf) {
-    await authenticateClient(chatId, session);
+  // Re-busca a sessão atualizada para evitar stale reference
+  if (updated.cpf) {
+    await authenticateClient(chatId, updated, log);
   }
-  // Caso contrário, o fluxo AWAITING_CPF continua aguardando o CPF
 }
 
 // ---------------------------------------------------------------------------
 // FASE 1c: Aguardando CPF
 // ---------------------------------------------------------------------------
 
-/**
- * Estado AWAITING_CPF — o usuário enviou (esperamos) um CPF.
- */
-async function handleAwaitingCpf(chatId, text, firstName, session) {
+async function handleAwaitingCpf(chatId, text, _firstName, log) {
   const cpfFromMessage = hermesAI.extractCpf(text);
 
   if (!cpfFromMessage || !hermesAI.isValidCpf(cpfFromMessage)) {
-    // Não parece um CPF válido — pode ser que o usuário não entendeu
     await telegram.sendMessage(
       chatId,
       '❌ Não consegui identificar um CPF válido na sua mensagem.\n\n' +
@@ -357,15 +338,15 @@ async function handleAwaitingCpf(chatId, text, firstName, session) {
     return;
   }
 
-  // CPF válido detectado
-  updateSession(chatId, State.AWAITING_CPF, { cpf: cpfFromMessage });
+  // Atualiza a sessão E re-busca a referência fresca
+  const updated = updateSession(chatId, State.AWAITING_CPF, { cpf: cpfFromMessage });
   appendHistory(chatId, 'system', `CPF validado: ${cpfFromMessage}`);
 
   await telegram.sendMessage(chatId, '✅ CPF recebido! Estou consultando seu cadastro...');
 
-  // Se já temos telefone, autentica; senão, pergunta
-  if (session.phone) {
-    await authenticateClient(chatId, session);
+  // Usa a referência atualizada — não a "session" original (stale)
+  if (updated.phone) {
+    await authenticateClient(chatId, updated, log);
   } else {
     await telegram.requestContact(
       chatId,
@@ -378,30 +359,23 @@ async function handleAwaitingCpf(chatId, text, firstName, session) {
 // FASE 1d: Aguardando Nome (para novos clientes)
 // ---------------------------------------------------------------------------
 
-/**
- * Estado AWAITING_NAME — cliente novo, precisamos do nome.
- * Após coletar o nome, cria o registro no CRM (Contato + Negócio ou Lead).
- */
-async function handleAwaitingName(chatId, text, session) {
-  const name = text.trim();
+async function handleAwaitingName(chatId, text, log) {
+  const name = (text || '').trim();
   if (name.length < 2) {
     await telegram.sendMessage(chatId, 'Por favor, informe seu <b>nome completo</b>:');
     return;
   }
 
-  // Atualiza sessão com o nome
-  updateSession(chatId, State.AUTHENTICATED, { name });
+  const updated = updateSession(chatId, State.AUTHENTICATED, { name });
 
-  // Se é um cliente novo (_pendingCreate), cria o registro no CRM
-  if (session._pendingCreate) {
+  if (updated._pendingCreate) {
     try {
       await telegram.sendMessage(chatId, '📝 Criando seu cadastro no sistema...');
 
-      // Cria Contato + Negócio no CRM (combo completo)
       const { contactId, dealId } = await bitrix24.createContactAndDeal({
         name,
-        phone: session.phone || undefined,
-        cpf: session.cpf || undefined,
+        phone: updated.phone || undefined,
+        cpf: updated.cpf || undefined,
       });
 
       updateSession(chatId, State.AUTHENTICATED, {
@@ -416,14 +390,14 @@ async function handleAwaitingName(chatId, text, session) {
           `Seu registro já está em nosso sistema jurídico.`
       );
     } catch (err) {
-      console.error('[CRM] Erro ao criar Contato+Negócio:', err.message);
+      log.error(`Erro ao criar Contato+Negócio: ${err.message}`);
 
-      // Fallback: tenta criar apenas um Lead (mais simples)
+      // Fallback: tenta criar apenas um Lead
       try {
         const leadId = await bitrix24.createLead({
           name,
-          phone: session.phone || undefined,
-          cpf: session.cpf || undefined,
+          phone: updated.phone || undefined,
+          cpf: updated.cpf || undefined,
         });
 
         updateSession(chatId, State.AUTHENTICATED, {
@@ -436,14 +410,13 @@ async function handleAwaitingName(chatId, text, session) {
           `✅ Cadastro criado, <b>${name}</b>! Nossa equipe entrará em contato em breve.`
         );
       } catch (leadErr) {
-        console.error('[CRM] Erro ao criar Lead (fallback):', leadErr.message);
-        // Mesmo com erro no CRM, o cliente pode continuar usando o bot
+        log.error(`Erro ao criar Lead (fallback): ${leadErr.message}`);
         await telegram.sendMessage(
           chatId,
-          `⚠ Tivemos uma dificuldade ao criar seu cadastro, mas você já pode usar nosso atendimento.\n` +
+          `⚠️ Tivemos uma dificuldade ao criar seu cadastro, mas você já pode usar nosso atendimento.\n` +
             `Para agilizar, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
         );
-        delete session._pendingCreate;
+        updateSession(chatId, State.AUTHENTICATED, { _pendingCreate: false });
       }
     }
   } else {
@@ -460,15 +433,10 @@ async function handleAwaitingName(chatId, text, session) {
 // FASE 1e: Autenticação contra o CRM
 // ---------------------------------------------------------------------------
 
-/**
- * Busca o cliente no CRM do Bitrix24 por CPF e telefone.
- * Se encontrado, autentica. Se não, cria novo registro.
- */
-async function authenticateClient(chatId, session) {
+async function authenticateClient(chatId, session, log) {
   try {
     await telegram.sendMessage(chatId, '🔍 Consultando nosso sistema...');
 
-    // Busca em Contatos e Leads simultaneamente
     const [contacts, leads] = await Promise.all([
       bitrix24.findContactByCpfOrPhone({ cpf: session.cpf, phone: session.phone }),
       bitrix24.findLeadByCpfOrPhone({ cpf: session.cpf, phone: session.phone }),
@@ -478,10 +446,9 @@ async function authenticateClient(chatId, session) {
     const foundLead = leads?.[0];
 
     if (foundContact) {
-      // -- Cliente encontrado no CRM --
       const contactName =
         [foundContact.NAME, foundContact.LAST_NAME].filter(Boolean).join(' ') || 'Cliente';
-      updateSession(chatId, State.AUTHENTICATED, {
+      const authenticated = updateSession(chatId, State.AUTHENTICATED, {
         name: contactName,
         crmContactId: foundContact.ID,
       });
@@ -491,53 +458,43 @@ async function authenticateClient(chatId, session) {
         `✅ <b>Identidade confirmada!</b>\nBem-vindo(a) de volta, ${contactName}.`
       );
 
-      // Busca negócios vinculados para referência
       const deals = await bitrix24.getDealsByContact(foundContact.ID);
       if (deals.length > 0) {
-        updateSession(chatId, State.AUTHENTICATED, {
-          crmDealId: deals[0].ID,
-        });
+        updateSession(chatId, State.AUTHENTICATED, { crmDealId: deals[0].ID });
       }
 
       await showMainMenu(chatId, getSession(chatId));
     } else if (foundLead) {
-      // -- Lead encontrado --
+      const leadName = foundLead.NAME || foundLead.TITLE || 'Cliente';
       updateSession(chatId, State.AUTHENTICATED, {
-        name: foundLead.NAME || foundLead.TITLE || 'Cliente',
+        name: leadName,
         crmContactId: foundLead.ID,
       });
 
       await telegram.sendMessage(
         chatId,
-        `✅ <b>Cadastro localizado!</b>\nBem-vindo(a), ${foundLead.NAME || foundLead.TITLE || 'Cliente'}.`
+        `✅ <b>Cadastro localizado!</b>\nBem-vindo(a), ${leadName}.`
       );
       await showMainMenu(chatId, getSession(chatId));
     } else {
-      // -- Cliente NOVO: criar registro no CRM --
+      // -- Cliente NOVO
       await telegram.sendMessage(
         chatId,
         '🆕 Não encontramos seu cadastro em nosso sistema. Vou criar seu registro agora.\n\n' +
           'Por favor, me informe seu <b>nome completo</b>:'
       );
 
-      // Salva os dados já coletados e aguarda o nome
       updateSession(chatId, State.AWAITING_NAME, {
         crmContactId: null,
         crmDealId: null,
+        _pendingCreate: true,
       });
-
-      // Assim que o nome chegar (handleAwaitingName), seguimos para criar no CRM
-      // A criação acontece em handleAwaitingName → após coletar nome
-      // Vamos ajustar: interceptamos após o nome ser coletado
-
-      // Guardamos o callback de criação para após o nome
-      session._pendingCreate = true;
     }
   } catch (err) {
-    console.error('[Auth] Erro ao consultar CRM:', err.message);
+    log.error(`Erro ao consultar CRM: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠ No momento nosso sistema de consultas está em manutenção. ` +
+      `⚠️ No momento nosso sistema de consultas está em manutenção. ` +
         `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
   }
@@ -547,17 +504,10 @@ async function authenticateClient(chatId, session) {
 // FASE 2: Menu Principal e Interações Autenticadas
 // =============================================================================
 
-/**
- * Estado AUTHENTICATED — processa texto livre via IA e encaminha.
- */
-async function handleAuthenticated(chatId, text, session) {
-  // Classifica a intenção via Hermes AI (ou regex fallback)
-  const { intent, confidence } = await hermesAI.classifyIntent(
-    text,
-    session.history || []
-  );
+async function handleAuthenticated(chatId, text, session, log) {
+  const { intent, confidence } = await hermesAI.classifyIntent(text, session.history || []);
 
-  console.log(`[HermesAI] Intenção: ${intent} (confiança: ${(confidence * 100).toFixed(0)}%)`);
+  log.info(`Intenção: ${intent} (confiança: ${(confidence * 100).toFixed(0)}%)`);
 
   switch (intent) {
     case hermesAI.Intent.STATUS_PROCESSO:
@@ -574,7 +524,7 @@ async function handleAuthenticated(chatId, text, session) {
 
     case hermesAI.Intent.FALAR_EQUIPE:
     case hermesAI.Intent.DUVIDA_COMPLEXA:
-      await handleHandoff(chatId, session);
+      await handleHandoff(chatId, session, log);
       break;
 
     case hermesAI.Intent.SAUDACAO:
@@ -590,7 +540,6 @@ async function handleAuthenticated(chatId, text, session) {
       break;
 
     case hermesAI.Intent.FORNECER_CPF:
-      // O cliente enviou CPF mesmo já autenticado — ignora ou atualiza
       await telegram.sendMessage(
         chatId,
         'Seu CPF já foi registrado nesta conversa. Como posso ajudar?'
@@ -599,7 +548,6 @@ async function handleAuthenticated(chatId, text, session) {
       break;
 
     default:
-      // Intenção não clara — oferece o menu
       await telegram.sendMessage(
         chatId,
         'Não entendi exatamente o que você precisa. Aqui estão as opções disponíveis:'
@@ -612,10 +560,6 @@ async function handleAuthenticated(chatId, text, session) {
 // Menu Principal (inline keyboard)
 // ---------------------------------------------------------------------------
 
-/**
- * Exibe o menu híbrido com botões inline.
- * O cliente pode clicar nos botões OU digitar em texto livre (interpretado pela IA).
- */
 async function showMainMenu(chatId, session) {
   const name = session.name || 'Cliente';
 
@@ -640,9 +584,6 @@ async function showMainMenu(chatId, session) {
 // OPÇÃO 1: Status do Processo
 // =============================================================================
 
-/**
- * Solicita o CPF para consulta de status.
- */
 async function promptForStatusCpf(chatId) {
   updateSession(chatId, State.AWAITING_STATUS_CPF);
 
@@ -653,10 +594,7 @@ async function promptForStatusCpf(chatId) {
   );
 }
 
-/**
- * Busca os negócios/processos vinculados ao CPF informado.
- */
-async function handleStatusLookup(chatId, text, session) {
+async function handleStatusLookup(chatId, text, log) {
   const cpf = hermesAI.extractCpf(text);
 
   if (!cpf) {
@@ -670,7 +608,6 @@ async function handleStatusLookup(chatId, text, session) {
   try {
     await telegram.sendMessage(chatId, '🔍 Consultando processos...');
 
-    // Busca contato pelo CPF e depois os negócios
     const contacts = await bitrix24.findContactByCpfOrPhone({ cpf });
     const contact = contacts?.[0];
 
@@ -691,11 +628,10 @@ async function handleStatusLookup(chatId, text, session) {
     if (!deals || deals.length === 0) {
       await telegram.sendMessage(
         chatId,
-        'ℹ Não há processos ativos vinculados ao seu CPF no momento.\n\n' +
+        'ℹ️ Não há processos ativos vinculados ao seu CPF no momento.\n\n' +
           'Se acredita que isso é um erro, por favor entre em contato com nossa equipe.'
       );
     } else {
-      // Formata a lista de processos
       const dealList = deals
         .map((deal, i) => {
           const date = deal.DATE_CREATE
@@ -719,10 +655,10 @@ async function handleStatusLookup(chatId, text, session) {
     updateSession(chatId, State.AUTHENTICATED);
     await showMainMenu(chatId, getSession(chatId));
   } catch (err) {
-    console.error('[Status] Erro ao consultar processos:', err.message);
+    log.error(`Erro ao consultar processos: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠ No momento nosso sistema de consultas está em manutenção. ` +
+      `⚠️ No momento nosso sistema de consultas está em manutenção. ` +
         `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
     updateSession(chatId, State.AUTHENTICATED);
@@ -734,9 +670,6 @@ async function handleStatusLookup(chatId, text, session) {
 // OPÇÃO 2: Agendamento de Horário
 // =============================================================================
 
-/**
- * Exibe as opções de agendamento: link do Booking do CRM.
- */
 async function handleAgendamento(chatId, session) {
   try {
     const bookingLink = bitrix24.getBookingLink();
@@ -749,7 +682,6 @@ async function handleAgendamento(chatId, session) {
         `<i>Ao clicar no link, você poderá escolher o melhor dia e horário disponível.</i>`
     );
 
-    // Também podemos tentar listar slots disponíveis (se o Resource Booking estiver ativo)
     const slots = await bitrix24.getAvailableSlots();
     if (slots && slots.length > 0) {
       const slotInfo = slots
@@ -762,10 +694,10 @@ async function handleAgendamento(chatId, session) {
       );
     }
   } catch (err) {
-    console.error('[Agendamento] Erro:', err.message);
+    logger.error(`[Agendamento] Erro: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠ No momento o sistema de agendamento está em manutenção. ` +
+      `⚠️ No momento o sistema de agendamento está em manutenção. ` +
         `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
   }
@@ -777,9 +709,6 @@ async function handleAgendamento(chatId, session) {
 // OPÇÃO 3: Solicitar uma Chamada
 // =============================================================================
 
-/**
- * Pergunta detalhes sobre a chamada (telefone de contato, preferência de horário).
- */
 async function promptForCallbackDetails(chatId) {
   updateSession(chatId, State.AWAITING_CALLBACK_DETAILS);
 
@@ -793,18 +722,14 @@ async function promptForCallbackDetails(chatId) {
   );
 }
 
-/**
- * Processa os detalhes da chamada e registra a atividade no CRM.
- */
-async function handleCallbackDetails(chatId, text, session) {
+async function handleCallbackDetails(chatId, text, log) {
   try {
     await telegram.sendMessage(chatId, '📞 Registrando sua solicitação de chamada...');
 
-    // Extrai telefone do texto (formato comum brasileiro)
     const phoneMatch = text.match(/(\d{2}\s?\d{4,5}-?\d{4})/);
+    const session = getSession(chatId);
     const callbackPhone = phoneMatch ? phoneMatch[1] : session.phone || 'Não informado';
 
-    // Cria atividade de chamada no CRM
     await bitrix24.createCallActivity({
       ownerId: config.bitrix24.operatorAliceId,
       contactId: session.crmContactId || undefined,
@@ -820,10 +745,10 @@ async function handleCallbackDetails(chatId, text, session) {
         `<i>Detalhes da sua solicitação: "${text}"</i>`
     );
   } catch (err) {
-    console.error('[Chamada] Erro ao registrar atividade:', err.message);
+    log.error(`Erro ao registrar atividade de chamada: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠ No momento o sistema de registro de chamadas está em manutenção. ` +
+      `⚠️ No momento o sistema de registro de chamadas está em manutenção. ` +
         `Por favor, entre em contato diretamente pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
   }
@@ -838,15 +763,8 @@ async function handleCallbackDetails(chatId, text, session) {
 
 /**
  * Executa o protocolo de transbordo para a operadora Alice via Open Channels.
- *
- * Fluxo:
- * 1. Gera resumo da conversa (Hermes IA)
- * 2. Envia mensagem oculta (whisper) com o resumo para a Alice
- * 3. Notifica Alice via IM interno
- * 4. Transfere o chat do Open Channel para Alice
- * 5. Informa o cliente que um humano assumirá
  */
-async function handleHandoff(chatId, session) {
+async function handleHandoff(chatId, session, log) {
   try {
     await telegram.sendMessage(
       chatId,
@@ -857,30 +775,30 @@ async function handleHandoff(chatId, session) {
 
     updateSession(chatId, State.HANDOFF);
 
-    // 1. Gerar resumo da conversa via Hermes IA
     const summary = await hermesAI.generateSummary(session.history || []);
 
-    // 2. Enviar mensagem oculta (whisper) no Canal Aberto
-    // O dialogId do Open Channel geralmente é obtido da configuração ou
-    // da sessão ativa. Aqui usamos o chatId mapeado conforme a integração.
+    // Whisper no Open Channel — usa BBCode (não HTML) para o Bitrix24 IM
     const dialogId = `chat${chatId}`;
-    await bitrix24.sendWhisperMessage({
-      dialogId,
-      message: [
-        `<b>🤖 Resumo Hermes — Atendimento Telegram</b>`,
-        ``,
-        `<b>Cliente:</b> ${session.name || 'Não identificado'}`,
-        `<b>CPF:</b> ${session.cpf || 'Não informado'}`,
-        `<b>Telefone:</b> ${session.phone || 'Não informado'}`,
-        ``,
-        `<b>📋 Resumo da conversa:</b>`,
-        summary,
-        ``,
-        `<i>Gerado automaticamente pelo Hermes. ${new Date().toLocaleString('pt-BR')}</i>`,
-      ].join('\n'),
-    });
+    const whisperMessage = [
+      '[B]🤖 Resumo Hermes — Atendimento Telegram[/B]',
+      '',
+      `[B]Cliente:[/B] ${session.name || 'Não identificado'}`,
+      `[B]CPF:[/B] ${session.cpf || 'Não informado'}`,
+      `[B]Telefone:[/B] ${session.phone || 'Não informado'}`,
+      '',
+      '[B]📋 Resumo da conversa:[/B]',
+      summary,
+      '',
+      `[I]Gerado automaticamente pelo Hermes. ${new Date().toLocaleString('pt-BR')}[/I]`,
+    ].join('\n');
 
-    // 3. Notificar Alice via chat interno do Bitrix24
+    try {
+      await bitrix24.sendWhisperMessage({ dialogId, message: whisperMessage });
+    } catch (whisperErr) {
+      log.warn(`Whisper message falhou (continuando): ${whisperErr.message}`);
+    }
+
+    // Notificação BBCode para Alice
     await bitrix24.notifyOperator({
       operatorId: config.bitrix24.operatorAliceId,
       clientName: session.name || 'Cliente não identificado',
@@ -888,19 +806,18 @@ async function handleHandoff(chatId, session) {
       summary,
     });
 
-    // 4. Tentar transferir o chat do Open Channel para Alice
+    // Transferência automática — exige SESSION_ID (obtido via webhook Bitrix24)
+    // Se não temos sessionId, o operador atende manualmente após notificação.
     try {
       await bitrix24.assignChatToOperator({
         chatId: dialogId,
+        sessionId: session.bxSessionId, // Pode ser undefined — fallback manual
         operatorId: config.bitrix24.operatorAliceId,
       });
     } catch (transferErr) {
-      // A transferência pode falhar se o chat ainda não existir no Open Channel
-      // Neste caso, Alice receberá a notificação e poderá puxar o chat manualmente
-      console.log('[Handoff] Transferência automática indisponível:', transferErr.message);
+      log.warn(`Transferência automática indisponível: ${transferErr.message}`);
     }
 
-    // 5. Mensagem final para o cliente
     await telegram.sendMessage(
       chatId,
       '✅ <b>Você está na fila de atendimento humano.</b>\n\n' +
@@ -912,24 +829,20 @@ async function handleHandoff(chatId, session) {
 
     appendHistory(chatId, 'system', 'Handoff para Alice concluído.');
   } catch (err) {
-    console.error('[Handoff] Erro no transbordo:', err.message);
+    log.error(`Erro no transbordo: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠ Encontramos uma dificuldade ao transferir seu atendimento. ` +
+      `⚠️ Encontramos uma dificuldade ao transferir seu atendimento. ` +
         `Por favor, entre em contato diretamente pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
   }
 }
 
 // ---------------------------------------------------------------------------
-// Estado HANDOFF — cliente já transferido
+// Estado HANDOFF
 // ---------------------------------------------------------------------------
 
-/**
- * Estado HANDOFF — o cliente já foi transferido.
- * Qualquer mensagem adicional é encaminhada como nota.
- */
-async function handleHandoffState(chatId, text) {
+async function handleHandoffState(chatId, _text) {
   await telegram.sendMessage(
     chatId,
     'Você está na fila de atendimento humano. Nossa equipe já foi notificada e ' +
@@ -942,22 +855,19 @@ async function handleHandoffState(chatId, text) {
 // HANDLER: /start
 // =============================================================================
 
-/**
- * Reinicia a conversa — limpa o estado e volta ao IDLE.
- */
 async function handleStart(chatId, firstName) {
   deleteSession(chatId);
-  const session = getSession(chatId);
+  getSession(chatId); // Cria nova sessão limpa
   await handleIdle(chatId, null, firstName);
 }
 
 // =============================================================================
-// Inicialização do Servidor
+// Inicialização do Servidor + Graceful Shutdown
 // =============================================================================
 
 const PORT = config.port;
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('');
   console.log('══════════════════════════════════════════════');
   console.log('  🤖 Hermes Bot — Brandão Correa Assessoria');
@@ -965,21 +875,50 @@ app.listen(PORT, () => {
   console.log(`  Servidor:  http://localhost:${PORT}`);
   console.log(`  Webhook:   http://localhost:${PORT}/webhook/telegram`);
   console.log(`  Health:    http://localhost:${PORT}/health`);
-  console.log(`  Ambiente:  ${process.env.NODE_ENV || 'development'}`);
+  console.log(`  Ambiente:  ${config.nodeEnv}`);
   console.log(`  Bitrix24:  ${config.bitrix24.domain}`);
   console.log(`  IA Ativa:  ${config.hermesAI.apiKey ? 'Sim' : 'Não (regex fallback)'}`);
+  console.log(`  Secret:    ${config.telegram.webhookSecretToken ? 'Sim' : 'Não (inseguro!)'}`);
   console.log('══════════════════════════════════════════════');
   console.log('');
 });
 
-// -- Tratamento de erros não capturados (segurança)
+// -- Graceful shutdown
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`Recebido ${signal} — encerrando graciosamente...`);
+
+  // Para de aceitar novas conexões
+  server.close((err) => {
+    if (err) logger.error(`Erro ao fechar servidor: ${err.message}`);
+    else logger.info('Servidor HTTP fechado.');
+
+    // Limpa intervalo de sessões
+    destroySessionCleanup();
+
+    logger.info('Shutdown completo. Adeus! 👋');
+    process.exit(err ? 1 : 0);
+  });
+
+  // Force-exit após 10s se algo travar
+  setTimeout(() => {
+    logger.error('Timeout no graceful shutdown — forçando exit.');
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// -- Tratamento de erros não capturados (não derruba o processo, mas loga)
 process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught Exception:', err);
-  // Não derruba o processo, mas loga
+  logger.error(`[FATAL] Uncaught Exception: ${err.message}`, { stack: err.stack });
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled Rejection:', reason);
+  logger.error(`[FATAL] Unhandled Rejection: ${reason}`);
 });
 
 export default app;

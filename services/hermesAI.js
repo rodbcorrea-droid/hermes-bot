@@ -7,6 +7,8 @@
 
 import axios from 'axios';
 import config from '../config/index.js';
+import { withRetry } from '../utils/retry.js';
+import { logger } from '../utils/logger.js';
 
 // ---------------------------------------------------------------------------
 // Constantes de intenção reconhecidas pelo Hermes
@@ -56,6 +58,9 @@ Regras:
 - Se a mensagem contiver um número com 11 dígitos (pontuado ou não), é FORNECER_CPF.
 - Se o cliente demonstrar frustração ou insistir em falar com pessoa, é FALAR_EQUIPE.
 - Perguntas jurídicas específicas são DUVIDA_COMPLEXA.
+
+Formato de saída:
+{"intent": "NOME_DA_INTENCAO", "confidence": 0.95, "reasoning": "explicação curta"}
 `.trim();
 
 // ---------------------------------------------------------------------------
@@ -81,7 +86,7 @@ Seja conciso. Máximo 250 palavras. Tom profissional e direto.
 // Build do cliente HTTP conforme o provedor
 // ---------------------------------------------------------------------------
 function buildAiClient() {
-  const { provider, apiKey, baseUrl, model } = config.hermesAI;
+  const { provider, apiKey, baseUrl, model, supportsJsonMode } = config.hermesAI;
 
   if (!apiKey) {
     return null; // Sem chave, fallback para classificação por regex
@@ -115,7 +120,7 @@ function buildAiClient() {
       };
   }
 
-  return { endpoint, headers, model, provider };
+  return { endpoint, headers, model, provider, supportsJsonMode };
 }
 
 // ---------------------------------------------------------------------------
@@ -125,9 +130,8 @@ function buildAiClient() {
 /**
  * Analisa a mensagem do usuário e retorna a intenção classificada.
  * Se nenhuma chave de IA estiver configurada, usa fallback por regex.
- *
- * @param {string} userMessage - Texto livre enviado pelo cliente
- * @param {Array<object>} [history=[]] - Histórico recente (para contexto)
+ * @param {string} userMessage
+ * @param {Array<object>} [history=[]]
  * @returns {Promise<{intent: string, confidence: number, reasoning: string}>}
  */
 export async function classifyIntent(userMessage, history = []) {
@@ -160,7 +164,7 @@ export async function classifyIntent(userMessage, history = []) {
 
     return regexClassify(userMessage);
   } catch (err) {
-    console.error('[HermesAI] Erro na classificação via LLM:', err.message);
+    logger.error(`[HermesAI] Erro na classificação via LLM: ${err.message}`);
     // Fallback silencioso para regex
     return regexClassify(userMessage);
   }
@@ -175,18 +179,32 @@ async function classifyWithOpenAI(client, userMessage, history) {
     { role: 'user', content: userMessage },
   ];
 
-  const { data } = await axios.post(
-    client.endpoint,
-    {
-      model: client.model,
-      messages,
-      temperature: 0.1,
-      max_tokens: 200,
-      response_format: { type: 'json_object' },
-    },
-    {
+  const body = {
+    model: client.model,
+    messages,
+    temperature: 0.1,
+    max_tokens: 200,
+  };
+
+  // Só habilita response_format json_object quando o provedor suporta
+  if (client.supportsJsonMode) {
+    body.response_format = { type: 'json_object' };
+  }
+
+  const { data } = await withRetry(
+    () => axios.post(client.endpoint, body, {
       headers: client.headers,
-      timeout: 8_000,
+      timeout: config.hermesAI.timeoutMs,
+    }),
+    {
+      maxAttempts: 2,
+      baseDelayMs: 400,
+      label: 'hermesAI.classify.openai',
+      shouldRetry: (err) => {
+        // Não retentar 400 (JSON mode não suportado, prompt muito longo, etc.)
+        if (err.response && err.response.status < 500) return false;
+        return true;
+      },
     }
   );
 
@@ -197,18 +215,26 @@ async function classifyWithOpenAI(client, userMessage, history) {
 // 1b. Classificação via Anthropic
 // ---------------------------------------------------------------------------
 async function classifyWithAnthropic(client, userMessage, history) {
-  const { data } = await axios.post(
-    client.endpoint,
+  const { data } = await withRetry(
+    () => axios.post(
+      client.endpoint,
+      {
+        model: client.model,
+        system: CLASSIFICATION_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userMessage }],
+        temperature: 0.1,
+        max_tokens: 200,
+      },
+      {
+        headers: client.headers,
+        timeout: config.hermesAI.timeoutMs,
+      }
+    ),
     {
-      model: client.model,
-      system: CLASSIFICATION_SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
-      temperature: 0.1,
-      max_tokens: 200,
-    },
-    {
-      headers: client.headers,
-      timeout: 8_000,
+      maxAttempts: 2,
+      baseDelayMs: 400,
+      label: 'hermesAI.classify.anthropic',
+      shouldRetry: (err) => err.response && err.response.status >= 500,
     }
   );
 
@@ -225,12 +251,12 @@ async function classifyWithAnthropic(client, userMessage, history) {
  * @param {string} message
  * @returns {{intent: string, confidence: number, reasoning: string}}
  */
-function regexClassify(message) {
-  const msg = message.toLowerCase().trim();
+export function regexClassify(message) {
+  const msg = (message || '').toLowerCase().trim();
 
-  // CPF: 11 dígitos com ou sem pontuação
-  const cpfPattern = /\d{3}\.?\d{3}\.?\d{3}-?\d{2}/;
-  if (cpfPattern.test(message)) {
+  // CPF: 11 dígitos com ou sem pontuação — regex ancorada com word boundaries
+  const cpfPattern = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/;
+  if (cpfPattern.test(message || '')) {
     return {
       intent: Intent.FORNECER_CPF,
       confidence: 0.99,
@@ -296,7 +322,7 @@ function regexClassify(message) {
   }
 
   // Dúvida complexa: se tem mais de 15 palavras e não caiu em nenhuma categoria
-  const wordCount = msg.split(/\s+/).length;
+  const wordCount = msg.split(/\s+/).filter(Boolean).length;
   if (wordCount > 15) {
     return {
       intent: Intent.DUVIDA_COMPLEXA,
@@ -320,7 +346,7 @@ function regexClassify(message) {
 export async function generateSummary(history) {
   const client = buildAiClient();
 
-  if (!client || history.length === 0) {
+  if (!client || !history || history.length === 0) {
     return buildFallbackSummary(history);
   }
 
@@ -334,46 +360,62 @@ export async function generateSummary(history) {
     let summary;
 
     if (client.provider === 'anthropic') {
-      const { data } = await axios.post(
-        client.endpoint,
+      const { data } = await withRetry(
+        () => axios.post(
+          client.endpoint,
+          {
+            model: client.model,
+            system: SUMMARY_SYSTEM_PROMPT,
+            messages: [
+              {
+                role: 'user',
+                content: `Transcrição da conversa:\n\n${transcript}\n\nGere o resumo para o atendente humano.`,
+              },
+            ],
+            temperature: 0.3,
+            max_tokens: 500,
+          },
+          { headers: client.headers, timeout: config.hermesAI.timeoutMs + 2000 }
+        ),
         {
-          model: client.model,
-          system: SUMMARY_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: 'user',
-              content: `Transcrição da conversa:\n\n${transcript}\n\nGere o resumo para o atendente humano.`,
-            },
-          ],
-          temperature: 0.3,
-          max_tokens: 500,
-        },
-        { headers: client.headers, timeout: 10_000 }
+          maxAttempts: 2,
+          baseDelayMs: 400,
+          label: 'hermesAI.summary.anthropic',
+          shouldRetry: (err) => err.response && err.response.status >= 500,
+        }
       );
       summary = data.content?.[0]?.text || '';
     } else {
-      const { data } = await axios.post(
-        client.endpoint,
+      const { data } = await withRetry(
+        () => axios.post(
+          client.endpoint,
+          {
+            model: client.model,
+            messages: [
+              { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+              {
+                role: 'user',
+                content: `Transcrição da conversa:\n\n${transcript}\n\nGere o resumo para o atendente humano.`,
+              },
+            ],
+            temperature: 0.3,
+            max_tokens: 500,
+          },
+          { headers: client.headers, timeout: config.hermesAI.timeoutMs + 2000 }
+        ),
         {
-          model: client.model,
-          messages: [
-            { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-            {
-              role: 'user',
-              content: `Transcrição da conversa:\n\n${transcript}\n\nGere o resumo para o atendente humano.`,
-            },
-          ],
-          temperature: 0.3,
-          max_tokens: 500,
-        },
-        { headers: client.headers, timeout: 10_000 }
+          maxAttempts: 2,
+          baseDelayMs: 400,
+          label: 'hermesAI.summary.openai',
+          shouldRetry: (err) => err.response && err.response.status >= 500,
+        }
       );
       summary = data.choices?.[0]?.message?.content || '';
     }
 
     return summary.trim() || buildFallbackSummary(history);
   } catch (err) {
-    console.error('[HermesAI] Erro ao gerar resumo:', err.message);
+    logger.error(`[HermesAI] Erro ao gerar resumo: ${err.message}`);
     return buildFallbackSummary(history);
   }
 }
@@ -387,8 +429,8 @@ export async function generateSummary(history) {
  * @param {Array<object>} history
  * @returns {string}
  */
-function buildFallbackSummary(history) {
-  if (history.length === 0) return 'Conversa sem histórico registrado.';
+export function buildFallbackSummary(history) {
+  if (!history || history.length === 0) return 'Conversa sem histórico registrado.';
 
   const userMessages = history
     .filter((h) => h.role === 'user')
@@ -411,11 +453,13 @@ function buildFallbackSummary(history) {
 
 /**
  * Extrai um número de CPF de uma string de texto.
+ * Usa word boundaries para evitar falsos positivos em números longos.
  * @param {string} text
  * @returns {string|null} CPF (apenas dígitos) ou null
  */
 export function extractCpf(text) {
-  const match = text.match(/(\d{3}\.?\d{3}\.?\d{3}-?\d{2})/);
+  if (!text) return null;
+  const match = text.match(/\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b/);
   if (match) {
     return match[1].replace(/\D/g, '');
   }
@@ -432,7 +476,7 @@ export function extractCpf(text) {
  * @returns {boolean}
  */
 export function isValidCpf(cpf) {
-  const digits = cpf.replace(/\D/g, '');
+  const digits = String(cpf || '').replace(/\D/g, '');
 
   if (digits.length !== 11) return false;
 
@@ -451,3 +495,5 @@ export function isValidCpf(cpf) {
 
   return true;
 }
+
+export { INTENT_LABELS };

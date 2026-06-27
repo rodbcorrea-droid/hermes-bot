@@ -6,6 +6,7 @@
 
 import axios from 'axios';
 import config from '../config/index.js';
+import { withRetry } from '../utils/retry.js';
 
 // ---------------------------------------------------------------------------
 // Cliente HTTP reutilizável (keep-alive, timeout)
@@ -24,6 +25,54 @@ const PARSE_MODES = Object.freeze({
   MARKDOWN: 'MarkdownV2',
   NONE: null,
 });
+
+// ---------------------------------------------------------------------------
+// Verificação do secret token do webhook (proteção contra forjamento)
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifica se o header X-Telegram-Bot-Api-Secret-Token é válido.
+ * Se TELEGRAM_WEBHOOK_SECRET_TOKEN não estiver configurado, aceita qualquer.
+ * @param {import('express').Request} req
+ * @returns {boolean}
+ */
+export function isValidWebhookSecret(req) {
+  const expected = config.telegram.webhookSecretToken;
+  if (!expected) return true; // Sem secret configurado = sem verificação
+  const got = req.get('X-Telegram-Bot-Api-Secret-Token');
+  return !!got && got === expected;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: chama a API do Telegram com retry (erros 5xx e timeouts)
+// ---------------------------------------------------------------------------
+async function tgCall(path, payload, opts = {}) {
+  return withRetry(
+    async () => {
+      const { data } = await telegramClient.post(path, payload, {
+        timeout: opts.timeoutMs,
+        // Retry só em 5xx e erros de rede (não em 4xx)
+        validateStatus: (s) => s < 500,
+      });
+      if (data && data.ok === false) {
+        const err = new Error(`[Telegram] ${data.description || 'API error'}`);
+        err.tgError = data;
+        throw err;
+      }
+      return data;
+    },
+    {
+      maxAttempts: 3,
+      baseDelayMs: 400,
+      label: `telegram.${path}`,
+      shouldRetry: (err) => {
+        // Não retentar erros 4xx do Telegram
+        if (err.response && err.response.status < 500) return false;
+        return true;
+      },
+    }
+  );
+}
 
 // ---------------------------------------------------------------------------
 // API: enviar mensagem de texto simples
@@ -55,8 +104,7 @@ export async function sendMessage(chatId, text, opts = {}) {
     payload.reply_markup = replyMarkup;
   }
 
-  const { data } = await telegramClient.post('/sendMessage', payload);
-  return data;
+  return tgCall('/sendMessage', payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -65,12 +113,9 @@ export async function sendMessage(chatId, text, opts = {}) {
 
 /**
  * Envia uma mensagem com botões inline (inline_keyboard).
- * Cada botão pode ter callback_data para ser processado via callback_query.
- *
  * @param {number|string} chatId
  * @param {string} text
  * @param {Array<Array<{text: string, callback_data: string}>>} buttons
- *   Matriz 2D: cada sub-array é uma linha de botões.
  * @param {object} [opts={}]
  * @returns {Promise<object>}
  */
@@ -82,17 +127,15 @@ export async function sendInlineKeyboard(chatId, text, buttons, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// API: responder callback_query (para evitar loading infinito no cliente)
+// API: responder callback_query
 // ---------------------------------------------------------------------------
 
 /**
- * Responde a um callback_query do Telegram (obrigatório para remover o
- * estado de "loading" do botão pressionado pelo usuário).
- *
- * @param {string} callbackQueryId - ID do callback_query recebido
+ * Responde a um callback_query do Telegram (remove loading do botão).
+ * @param {string} callbackQueryId
  * @param {object} [opts={}]
- * @param {string} [opts.text] - Texto de toast/alert (opcional)
- * @param {boolean} [opts.showAlert=false] - Se true, mostra popup em vez de toast
+ * @param {string} [opts.text]
+ * @param {boolean} [opts.showAlert=false]
  * @returns {Promise<void>}
  */
 export async function answerCallbackQuery(callbackQueryId, opts = {}) {
@@ -104,11 +147,11 @@ export async function answerCallbackQuery(callbackQueryId, opts = {}) {
     payload.show_alert = showAlert;
   }
 
-  await telegramClient.post('/answerCallbackQuery', payload);
+  await tgCall('/answerCallbackQuery', payload);
 }
 
 // ---------------------------------------------------------------------------
-// API: editar mensagem existente (útil para atualizar menus)
+// API: editar mensagem existente
 // ---------------------------------------------------------------------------
 
 /**
@@ -116,7 +159,7 @@ export async function answerCallbackQuery(callbackQueryId, opts = {}) {
  * @param {number|string} chatId
  * @param {number} messageId
  * @param {string} newText
- * @param {Array} [buttons=null] - Novo teclado inline (ou null para manter)
+ * @param {Array} [buttons=null]
  * @returns {Promise<object>}
  */
 export async function editMessageText(chatId, messageId, newText, buttons = null) {
@@ -132,20 +175,17 @@ export async function editMessageText(chatId, messageId, newText, buttons = null
     payload.reply_markup = { inline_keyboard: buttons };
   }
 
-  const { data } = await telegramClient.post('/editMessageText', payload);
-  return data;
+  return tgCall('/editMessageText', payload);
 }
 
 // ---------------------------------------------------------------------------
-// API: solicitar contato do usuário (botão "Compartilhar contato")
+// API: solicitar contato do usuário
 // ---------------------------------------------------------------------------
 
 /**
  * Envia uma mensagem com botão que solicita o contato do usuário.
- * O Telegram exibe um botão nativo "Compartilhar meu número".
- *
  * @param {number|string} chatId
- * @param {string} prompt - Texto explicativo
+ * @param {string} prompt
  * @returns {Promise<object>}
  */
 export async function requestContact(chatId, prompt) {
@@ -162,11 +202,11 @@ export async function requestContact(chatId, prompt) {
 }
 
 // ---------------------------------------------------------------------------
-// API: remover teclado customizado (voltar ao normal)
+// API: remover teclado customizado
 // ---------------------------------------------------------------------------
 
 /**
- * Remove o teclado customizado (reply keyboard) da tela do usuário.
+ * Remove o teclado customizado da tela do usuário.
  * @param {number|string} chatId
  * @param {string} [text='⌨ Teclado recolhido.']
  * @returns {Promise<object>}
@@ -179,18 +219,36 @@ export async function removeKeyboard(chatId, text = '⌨ Teclado recolhido.') {
 }
 
 // ---------------------------------------------------------------------------
+// API: configurar webhook (com secret_token)
+// ---------------------------------------------------------------------------
+
+/**
+ * Configura o webhook do Telegram no endpoint informado, incluindo secret_token.
+ * @param {string} webhookUrl - URL pública HTTPS do webhook
+ * @returns {Promise<object>}
+ */
+export async function setWebhook(webhookUrl) {
+  const payload = {
+    url: webhookUrl,
+    allowed_updates: ['message', 'callback_query', 'contact'],
+    drop_pending_updates: true,
+  };
+
+  if (config.telegram.webhookSecretToken) {
+    payload.secret_token = config.telegram.webhookSecretToken;
+  }
+
+  return tgCall('/setWebhook', payload);
+}
+
+// ---------------------------------------------------------------------------
 // API: extrair informações relevantes do payload do Telegram
 // ---------------------------------------------------------------------------
 
 /**
  * Extrai o objeto de chat e o texto/mensagem do payload recebido via webhook.
- * Lida com mensagens de texto, contatos compartilhados, e callback_queries.
- *
- * @param {object} body - Corpo completo do webhook do Telegram
- * @returns {{ chatId: number|null, text: string|null, contact: object|null,
- *             callbackQueryId: string|null, callbackData: string|null,
- *             messageId: number|null, firstName: string, lastName: string,
- *             username: string }}
+ * @param {object} body
+ * @returns {object}
  */
 export function extractPayload(body) {
   // Callback query (botão inline pressionado)

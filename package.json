@@ -1,12 +1,16 @@
 {
   "name": "brandao-correa-hermes-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bot Telegram inteligente (Hermes) para atendimento de clientes da Brandão Correa Assessoria Jurídica — integrado ao CRM Bitrix24 via Open Channels.",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "node --check server.js services/*.js middleware/*.js config/*.js utils/*.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
@@ -14,6 +18,10 @@
     "express": "^4.21.0",
     "helmet": "^7.1.0",
     "express-rate-limit": "^7.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9",
+    "vitest": "^1.6.0"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -7,6 +7,8 @@
 
 import axios from 'axios';
 import config from '../config/index.js';
+import { withRetry } from '../utils/retry.js';
+import { logger } from '../utils/logger.js';
 
 // ---------------------------------------------------------------------------
 // Cliente HTTP reutilizável para o Bitrix24
@@ -31,7 +33,7 @@ function unwrapResult(response, operation) {
   const { result, error } = response;
   if (error) {
     const err = new Error(
-      `[Bitrix24] Erro em ${operation}: ${error.error_name} — ${error.error_description}`
+      `[Bitrix24] Erro em ${operation}: ${error.error_name || error} — ${error.error_description || ''}`
     );
     err.bxError = error;
     throw err;
@@ -40,43 +42,97 @@ function unwrapResult(response, operation) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: chamada com retry (5xx e timeouts são transitórios)
+// ---------------------------------------------------------------------------
+async function bxCall(method, payload = {}, opts = {}) {
+  return withRetry(
+    async () => {
+      const { data } = await bxClient.post(method, payload, {
+        timeout: opts.timeoutMs,
+      });
+      return unwrapResult(data, method);
+    },
+    {
+      maxAttempts: 3,
+      baseDelayMs: 600,
+      label: `bitrix24.${method}`,
+      shouldRetry: (err) => {
+        // Não retentar erros 4xx (400/401/403/404) — são determinísticos
+        if (err.response && err.response.status < 500) return false;
+        // Erros de negócio do Bitrix24 (bxError) também não retentar
+        if (err.bxError) return false;
+        return true;
+      },
+    }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helper: normaliza telefone para busca no CRM
+// ---------------------------------------------------------------------------
+
+/**
+ * Retorna lista de variações de telefone para buscar no Bitrix24.
+ * Bitrix24 às vezes armazena com DDI (55), com zero inicial, ou só DDD+numero.
+ * @param {string} phone
+ * @returns {string[]}
+ */
+function phoneVariants(phone) {
+  const clean = String(phone || '').replace(/\D/g, '');
+  if (!clean) return [];
+  const variants = new Set([clean]);
+  // Com DDI 55
+  if (clean.length === 11) variants.add(`55${clean}`);
+  if (clean.length === 10) variants.add(`55${clean}`);
+  // Sem DDI (se tem 13 dígitos, remove 55)
+  if (clean.length === 13 && clean.startsWith('55')) variants.add(clean.slice(2));
+  // Com zero inicial (formato antigo)
+  if (clean.length === 11) variants.add(`0${clean}`);
+  // Só últimos 9 dígitos (sem DDD)
+  if (clean.length >= 9) variants.add(clean.slice(-9));
+  // Só últimos 10 (com nono dígito)
+  if (clean.length >= 10) variants.add(clean.slice(-10));
+  return [...variants];
+}
+
+// ---------------------------------------------------------------------------
 // 1. CRM — Busca de Contatos
 // ---------------------------------------------------------------------------
 
 /**
  * Busca contatos no CRM por CPF e/ou telefone.
- * O CPF é buscado em um campo personalizado (UF_CRM_*).
- * É necessário mapear o campo customizado de CPF no Bitrix24.
- *
+ * Usa o filtro OR do Bitrix24 com sintaxe correta (chaves numéricas).
  * @param {object} filters
- * @param {string} [filters.cpf] - CPF do cliente (apenas dígitos)
- * @param {string} [filters.phone] - Telefone do cliente
- * @returns {Promise<Array<object>>} Lista de contatos encontrados
+ * @param {string} [filters.cpf]
+ * @param {string} [filters.phone]
+ * @returns {Promise<Array<object>>}
  */
 export async function findContactByCpfOrPhone({ cpf, phone } = {}) {
-  const filter = { LOGIC: 'OR', '=0': {}, '=1': {} };
-  let idx = 0;
+  const orClauses = [];
 
   if (cpf) {
-    // Campo customizado de CPF — ajuste conforme o ID real do campo no seu CRM
-    filter[`=${idx}`] = { 'UF_CRM_CPF': cpf };
-    idx++;
+    orClauses.push({ [config.bitrix24.cpfCustomField]: cpf });
   }
 
   if (phone) {
-    const cleanPhone = phone.replace(/\D/g, '');
-    filter[`=${idx}`] = {
-      'PHONE': cleanPhone.length > 8 ? cleanPhone.slice(-9) : cleanPhone,
-    };
-    idx++;
+    for (const variant of phoneVariants(phone)) {
+      orClauses.push({ PHONE: variant });
+    }
   }
 
-  const { data } = await bxClient.post('/crm.contact.list.json', {
-    filter,
-    select: ['ID', 'NAME', 'LAST_NAME', 'PHONE', 'UF_CRM_CPF', 'EMAIL', 'STAGE_ID'],
+  if (orClauses.length === 0) return [];
+
+  // Sintaxe correta: LOGIC: 'OR' + chaves numéricas "0", "1", "2", ...
+  const filter = { LOGIC: 'OR' };
+  orClauses.forEach((clause, i) => {
+    filter[String(i)] = clause;
   });
 
-  const result = unwrapResult(data, 'crm.contact.list');
+  const result = await bxCall('/crm.contact.list.json', {
+    filter,
+    select: ['ID', 'NAME', 'LAST_NAME', 'PHONE', 'EMAIL', config.bitrix24.cpfCustomField],
+  });
+
   return Array.isArray(result) ? result : [];
 }
 
@@ -92,28 +148,30 @@ export async function findContactByCpfOrPhone({ cpf, phone } = {}) {
  * @returns {Promise<Array<object>>}
  */
 export async function findLeadByCpfOrPhone({ cpf, phone } = {}) {
-  const filter = { LOGIC: 'OR', '=0': {}, '=1': {} };
-  let idx = 0;
+  const orClauses = [];
 
   if (cpf) {
-    filter[`=${idx}`] = { 'UF_CRM_CPF': cpf };
-    idx++;
+    orClauses.push({ [config.bitrix24.cpfCustomField]: cpf });
   }
 
   if (phone) {
-    const cleanPhone = phone.replace(/\D/g, '');
-    filter[`=${idx}`] = {
-      'PHONE': cleanPhone.length > 8 ? cleanPhone.slice(-9) : cleanPhone,
-    };
-    idx++;
+    for (const variant of phoneVariants(phone)) {
+      orClauses.push({ PHONE: variant });
+    }
   }
 
-  const { data } = await bxClient.post('/crm.lead.list.json', {
-    filter,
-    select: ['ID', 'NAME', 'LAST_NAME', 'PHONE', 'UF_CRM_CPF', 'STATUS_ID'],
+  if (orClauses.length === 0) return [];
+
+  const filter = { LOGIC: 'OR' };
+  orClauses.forEach((clause, i) => {
+    filter[String(i)] = clause;
   });
 
-  const result = unwrapResult(data, 'crm.lead.list');
+  const result = await bxCall('/crm.lead.list.json', {
+    filter,
+    select: ['ID', 'NAME', 'LAST_NAME', 'PHONE', 'STATUS_ID', config.bitrix24.cpfCustomField],
+  });
+
   return Array.isArray(result) ? result : [];
 }
 
@@ -124,25 +182,24 @@ export async function findLeadByCpfOrPhone({ cpf, phone } = {}) {
 /**
  * Cria um novo Lead no funil inicial da Brandão Correa.
  * @param {object} leadData
- * @param {string} leadData.name - Nome completo do lead
- * @param {string} [leadData.phone] - Telefone
- * @param {string} [leadData.cpf] - CPF
- * @returns {Promise<object>} Lead criado (contém ID)
+ * @param {string} leadData.name
+ * @param {string} [leadData.phone]
+ * @param {string} [leadData.cpf]
+ * @returns {Promise<object>}
  */
 export async function createLead({ name, phone, cpf } = {}) {
   const fields = {
     TITLE: name || 'Lead via Telegram',
     NAME: name || 'Cliente Telegram',
-    SOURCE_ID: 'TELEGRAM',          // Fonte: Telegram
+    SOURCE_ID: 'TELEGRAM',
     SOURCE_DESCRIPTION: 'Captado via Bot Hermes (Telegram)',
     OPENED: 'Y',
   };
 
   if (phone) fields.PHONE = [{ VALUE: phone, VALUE_TYPE: 'MOBILE' }];
-  if (cpf) fields.UF_CRM_CPF = cpf;
+  if (cpf) fields[config.bitrix24.cpfCustomField] = cpf;
 
-  const { data } = await bxClient.post('/crm.lead.add.json', { fields });
-  return unwrapResult(data, 'crm.lead.add');
+  return bxCall('/crm.lead.add.json', { fields });
 }
 
 // ---------------------------------------------------------------------------
@@ -166,28 +223,22 @@ export async function createContactAndDeal({ name, phone, cpf } = {}) {
     OPENED: 'Y',
   };
   if (phone) contactFields.PHONE = [{ VALUE: phone, VALUE_TYPE: 'MOBILE' }];
-  if (cpf) contactFields.UF_CRM_CPF = cpf;
+  if (cpf) contactFields[config.bitrix24.cpfCustomField] = cpf;
 
-  const { data: contactDataResp } = await bxClient.post('/crm.contact.add.json', {
-    fields: contactFields,
-  });
-  const contactId = unwrapResult(contactDataResp, 'crm.contact.add');
+  const contactId = await bxCall('/crm.contact.add.json', { fields: contactFields });
 
   // 4b. Criar Negócio vinculado ao Contato
   const dealFields = {
     TITLE: `Atendimento Telegram — ${name || 'Novo Cliente'}`,
     CONTACT_ID: contactId,
-    CATEGORY_ID: 0,            // Funil padrão — ajuste conforme o funil do escritório
-    STAGE_ID: 'NEW',           // Estágio inicial
+    CATEGORY_ID: config.bitrix24.dealCategoryId,
+    STAGE_ID: config.bitrix24.dealStageNew,
     SOURCE_ID: 'TELEGRAM',
     SOURCE_DESCRIPTION: 'Oportunidade iniciada via Bot Hermes (Telegram)',
     OPENED: 'Y',
   };
 
-  const { data: dealData } = await bxClient.post('/crm.deal.add.json', {
-    fields: dealFields,
-  });
-  const dealId = unwrapResult(dealData, 'crm.deal.add');
+  const dealId = await bxCall('/crm.deal.add.json', { fields: dealFields });
 
   return { contactId, dealId };
 }
@@ -202,11 +253,11 @@ export async function createContactAndDeal({ name, phone, cpf } = {}) {
  * @returns {Promise<Array<object>>}
  */
 export async function getDealsByContact(contactId) {
-  const { data } = await bxClient.post('/crm.deal.list.json', {
+  const result = await bxCall('/crm.deal.list.json', {
     filter: { CONTACT_ID: contactId },
     select: ['ID', 'TITLE', 'STAGE_ID', 'DATE_CREATE', 'DATE_MODIFY', 'OPPORTUNITY'],
   });
-  return unwrapResult(data, 'crm.deal.list') || [];
+  return Array.isArray(result) ? result : [];
 }
 
 // ---------------------------------------------------------------------------
@@ -214,14 +265,12 @@ export async function getDealsByContact(contactId) {
 // ---------------------------------------------------------------------------
 
 /**
- * Cria uma atividade do tipo "Chamada" com prioridade alta no CRM,
- * associada ao contato/negócio do cliente.
- *
+ * Cria uma atividade do tipo "Chamada" com prioridade alta no CRM.
  * @param {object} params
- * @param {number} params.ownerId - ID do responsável (ex: Alice)
- * @param {number} [params.contactId] - ID do contato
- * @param {number} [params.dealId] - ID do negócio
- * @param {string} [params.phone] - Telefone para callback
+ * @param {number} params.ownerId
+ * @param {number} [params.contactId]
+ * @param {number} [params.dealId]
+ * @param {string} [params.phone]
  * @returns {Promise<object>}
  */
 export async function createCallActivity({ ownerId, contactId, dealId, phone } = {}) {
@@ -229,11 +278,11 @@ export async function createCallActivity({ ownerId, contactId, dealId, phone } =
     OWNER_ID: ownerId,
     TYPE_ID: 2,                     // 2 = Chamada (Call)
     SUBJECT: 'Solicitação de Chamada — Cliente Telegram',
-    DESCRIPTION: `
-      Cliente solicitou receber uma ligação via Bot Hermes (Telegram).
-      ${phone ? `Telefone informado: ${phone}` : 'Telefone: verificar cadastro do contato.'}
-      Prioridade: ALTA.
-    `.trim().replace(/\n\s+/g, '\n'),
+    DESCRIPTION: [
+      'Cliente solicitou receber uma ligação via Bot Hermes (Telegram).',
+      phone ? `Telefone informado: ${phone}` : 'Telefone: verificar cadastro do contato.',
+      'Prioridade: ALTA.',
+    ].join('\n'),
     PRIORITY: 1,                    // 1 = Alta
     DIRECTION: 2,                   // 2 = Saída (nós ligamos para o cliente)
     COMPLETED: 'N',
@@ -243,99 +292,105 @@ export async function createCallActivity({ ownerId, contactId, dealId, phone } =
   if (contactId) fields.OWNER_CONTACT_ID = contactId;
   if (dealId) fields.OWNER_DEAL_ID = dealId;
 
-  const { data } = await bxClient.post('/crm.activity.add.json', { fields });
-  return unwrapResult(data, 'crm.activity.add');
+  return bxCall('/crm.activity.add.json', { fields });
 }
 
 // ---------------------------------------------------------------------------
-// 7. Open Channels — Mensagem Oculta/Whisper (resumo para operador)
+// 7. Open Channels — Mensagem interna (somente operadores)
 // ---------------------------------------------------------------------------
 
 /**
- * Envia uma mensagem PRIVADA (whisper) no chat do Open Channel do Bitrix24.
- * Esta mensagem NÃO aparece para o cliente final, apenas para os operadores.
+ * Envia uma mensagem privada no chat do Open Channel, visível apenas para
+ * operadores (não para o cliente final).
  *
- * No Bitrix24, o parâmetro SYSTEM=Y envia mensagem de sistema visível apenas
- * internamente. Utilizamos o método im.message.add com DIALOG_ID do chat.
+ * Nota: o Bitrix24 não tem método REST direto para "whisper" real. A melhor
+ * abordagem é enviar uma mensagem com SYSTEM=Y via im.message.add — ela é
+ * exibida no chat interno com destaque visual (cinza/itálico) mas aparece
+ * no stream da conversa. Para whisper real, usar imopenlines.session.message.add
+ * (disponível em versões mais recentes).
  *
  * @param {object} params
  * @param {number|string} params.dialogId - ID do diálogo/canal aberto
- * @param {string} params.message - Conteúdo do resumo (HTML simples)
+ * @param {string} params.message - Conteúdo em **BBCode** (não HTML!)
  * @returns {Promise<object>}
  */
 export async function sendWhisperMessage({ dialogId, message } = {}) {
-  const { data } = await bxClient.post('/im.message.add.json', {
+  return bxCall('/im.message.add.json', {
     DIALOG_ID: dialogId,
     MESSAGE: message,
-    SYSTEM: 'Y',              // Mensagem do sistema — visível apenas para operadores
-    PARAMS: {
-      MENU: {},               // Sem menu, apenas texto informativo
-    },
+    SYSTEM: 'Y',
   });
-  return unwrapResult(data, 'im.message.add (whisper)');
 }
 
 // ---------------------------------------------------------------------------
-// 8. Open Channels — Notificação interna para operador Alice
+// 8. Open Channels — Notificação interna para operador
 // ---------------------------------------------------------------------------
 
 /**
  * Dispara uma notificação no chat interno do Bitrix24 (IM) alertando a
- * operadora Alice sobre um novo atendimento transferido.
+ * operadora Alice. Usa BBCode (não HTML) — Bitrix24 IM não suporta HTML.
  *
  * @param {object} params
- * @param {number} params.operatorId - ID do usuário Alice no Bitrix24
- * @param {string} params.clientName - Nome do cliente
- * @param {string} [params.clientCpf] - CPF do cliente
- * @param {string} [params.summary] - Breve resumo da conversa
+ * @param {number} params.operatorId
+ * @param {string} params.clientName
+ * @param {string} [params.clientCpf]
+ * @param {string} [params.summary]
  * @returns {Promise<object>}
  */
 export async function notifyOperator({ operatorId, clientName, clientCpf, summary } = {}) {
-  const message = [
-    `🔔 <b>Atenção Alice: novo cliente transferido do Telegram para o Canal Aberto.</b>`,
-    ``,
-    `👤 <b>Cliente:</b> ${clientName || 'Não identificado'}`,
-    clientCpf ? `🆔 <b>CPF:</b> ${clientCpf}` : '',
-    ``,
-    summary ? `📋 <b>Resumo da conversa com Hermes:</b>\n${summary}` : '',
-    ``,
-    `⏰ Verifique o histórico completo no Canal Aberto.`,
-  ]
-    .filter(Boolean)
-    .join('\n');
+  // BBCode — formato suportado pelo Bitrix24 IM
+  const lines = [
+    '🔔 [B]Atenção Alice: novo cliente transferido do Telegram para o Canal Aberto.[/B]',
+    '',
+    `👤 [B]Cliente:[/B] ${clientName || 'Não identificado'}`,
+    clientCpf ? `🆔 [B]CPF:[/B] ${clientCpf}` : '',
+    '',
+    summary ? `📋 [B]Resumo da conversa com Hermes:[/B]\n${summary}` : '',
+    '',
+    '⏰ Verifique o histórico completo no Canal Aberto.',
+  ].filter(Boolean);
 
-  const { data } = await bxClient.post('/im.notify.json', {
+  return bxCall('/im.notify.json', {
     to: operatorId,
-    message,
+    message: lines.join('\n'),
     type: 'SYSTEM',
   });
-  return unwrapResult(data, 'im.notify');
 }
 
 // ---------------------------------------------------------------------------
-// 9. Open Channels — Transferir chat para operador específico
+// 9. Open Channels — Transferir sessão para operador específico
 // ---------------------------------------------------------------------------
 
 /**
- * Atribui o chat de um Canal Aberto a um operador específico (Alice).
- * Utiliza o método imopenlines.operator.answer para o operador "atender"
- * a sessão, ou imopenlines.session.transfer para transferir.
+ * Atribui a sessão atual de um Canal Aberto a um operador específico.
  *
- * Nota: A API exata depende da versão do módulo Open Channels no Bitrix24.
- * Abaixo está a abordagem mais comum via REST.
+ * Bitrix24 NÃO tem método "imopenlines.operator.transfer" — o método correto
+ * é "imopenlines.session.transfer" (requer SESSION_ID, não CHAT_ID).
+ *
+ * Como o SESSION_ID precisa ser obtido do evento ONIMOPENLINESSESSIONSTART,
+ * esta função tenta (1) transferir via session.transfer se sessionId for
+ * fornecido, ou (2) apenas notifica o operador e deixa o atendimento manual.
  *
  * @param {object} params
- * @param {number|string} params.chatId - ID do chat no Open Channel
- * @param {number} params.operatorId - ID do operador Alice
- * @returns {Promise<object>}
+ * @param {number|string} [params.chatId] - ID do chat (legado, info only)
+ * @param {number} [params.sessionId] - ID da sessão do Open Channel
+ * @param {number} params.operatorId - ID do operador destino
+ * @returns {Promise<object>} Resultado da transferência (ou { skipped: true })
  */
-export async function assignChatToOperator({ chatId, operatorId } = {}) {
-  // Tenta transferir a sessão do Open Channel para o operador Alice
-  const { data } = await bxClient.post('/imopenlines.operator.transfer.json', {
-    CHAT_ID: chatId,
-    TRANSFER_ID: operatorId,
-  });
-  return unwrapResult(data, 'imopenlines.operator.transfer');
+export async function assignChatToOperator({ chatId, sessionId, operatorId } = {}) {
+  if (sessionId) {
+    return bxCall('/imopenlines.session.transfer.json', {
+      SESSION_ID: sessionId,
+      TRANSFER_ID: operatorId,
+    });
+  }
+  // Sem sessionId — não há API REST pública para transferir apenas com CHAT_ID.
+  // O operador receberá a notificação via notifyOperator() e atenderá manualmente.
+  logger.warn(
+    `[Bitrix24] assignChatToOperator chamado sem sessionId (chatId=${chatId}). ` +
+      `Transferência automática indisponível — operador deve assumir manualmente.`
+  );
+  return { skipped: true, reason: 'missing_session_id' };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,31 +400,25 @@ export async function assignChatToOperator({ chatId, operatorId } = {}) {
 /**
  * Retorna os slots disponíveis para agendamento via Resource Booking do CRM.
  * Depende do módulo Resource Booking estar configurado no Bitrix24.
- *
  * @param {object} [params]
- * @param {string} [params.from] - Data inicial (YYYY-MM-DD)
- * @param {string} [params.to] - Data final (YYYY-MM-DD)
- * @returns {Promise<Array<object>>} Slots disponíveis
+ * @param {string} [params.from]
+ * @param {string} [params.to]
+ * @returns {Promise<Array<object>>}
  */
 export async function getAvailableSlots({ from, to } = {}) {
-  // O endpoint exato depende da configuração do Resource Booking.
-  // Abaixo usamos o padrão de listagem de recursos e slots.
-  const resourceId = 1; // ID do recurso (ex: "Advogado") — parametrizar conforme CRM
-
-  const { data } = await bxClient.post('/resourcebooking.resource.list.json', {
+  const resourceId = 1; // TODO: parametrizar conforme CRM
+  const result = await bxCall('/resourcebooking.resource.list.json', {
     filter: { ID: resourceId },
   });
-
-  const resources = unwrapResult(data, 'resourcebooking.resource.list');
-  return resources || [];
+  return Array.isArray(result) ? result : [];
 }
 
 /**
- * Retorna o link inteligente do Booking do CRM para autoagendamento.
- * @returns {string} URL do Booking público
+ * Retorna o link público do Booking do CRM para autoagendamento.
+ * @returns {string}
  */
 export function getBookingLink() {
-  return `https://${config.bitrix24.domain}/pub/booking/`;
+  return config.bitrix24.bookingUrl;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,9 +431,10 @@ export function getBookingLink() {
  */
 export async function pingBitrix24() {
   try {
-    const { data } = await bxClient.post('/app.info.json', {});
-    return !!data.result;
-  } catch {
+    const result = await bxCall('/app.info.json', {});
+    return !!result;
+  } catch (err) {
+    logger.debug(`[Bitrix24] ping falhou: ${err.message}`);
     return false;
   }
 }
