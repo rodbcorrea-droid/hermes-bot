@@ -40,6 +40,9 @@ const CALLBACK = Object.freeze({
   MENU_FALAR_EQUIPE: 'MENU_FALAR_EQUIPE',
   MENU_VOLTAR: 'MENU_VOLTAR',
   CONFIRM_CPF: 'CONFIRM_CPF',
+  MENU_BOLETO: 'MENU_BOLETO',
+  MENU_PERICIA: 'MENU_PERICIA',
+  MENU_DOCUMENTOS: 'MENU_DOCUMENTOS',
 });
 
 const FALLBACK_PHONE = config.fallback.phone;
@@ -49,6 +52,9 @@ const FALLBACK_PHONE = config.fallback.phone;
 // =============================================================================
 
 const app = express();
+
+// -- Trust proxy (necessário para Cloudflare/nginx)
+app.set('trust proxy', 1);
 
 // -- Segurança básica
 app.use(helmet());
@@ -172,7 +178,7 @@ app.post('/webhook/bitrix24', bitrix24Limiter, async (req, res) => {
 async function handleTelegramUpdate(body, requestId) {
   const log = createLogger(requestId);
   const extracted = telegram.extractPayload(body);
-  const { chatId, text, contact, callbackData, callbackQueryId, messageId, firstName, lastName, username } = extracted;
+  const { chatId, text, contact, document, photo, caption, callbackData, callbackQueryId, messageId, firstName, lastName, username } = extracted;
 
   if (!chatId) {
     log.info('Payload sem chatId — ignorado.');
@@ -180,6 +186,21 @@ async function handleTelegramUpdate(body, requestId) {
   }
 
   const session = getSession(chatId);
+
+  // Captura dados do Telegram na sessão (para uso posterior no CRM)
+  if (firstName || lastName || username) {
+    updateSession(chatId, session.state, {
+      telegramFirstName: firstName || session.telegramFirstName || null,
+      telegramLastName: lastName || session.telegramLastName || null,
+      telegramUsername: username || session.telegramUsername || null,
+    });
+  }
+
+  // Verificar se recebeu documento ou foto
+  if (document || photo) {
+    await handleDocumentoRecebido(chatId, document, photo, caption, session, log);
+    return;
+  }
 
   if (text) {
     appendHistory(chatId, 'user', text);
@@ -195,6 +216,12 @@ async function handleTelegramUpdate(body, requestId) {
   // -- Comando /start
   if (text === '/start') {
     await handleStart(chatId, firstName);
+    return;
+  }
+
+  // -- Comando /cancelar
+  if (text === '/cancelar') {
+    await handleCancel(chatId, firstName);
     return;
   }
 
@@ -217,6 +244,14 @@ async function handleTelegramUpdate(body, requestId) {
     case State.AWAITING_NAME:
       await handleAwaitingName(chatId, text, log);
       break;
+    case State.AWAITING_EMAIL:
+      await handleAwaitingEmail(chatId, text, session, log);
+      break;
+    case State.AWAITING_PERICIA_CONFIRM:
+    case State.AWAITING_PERICIA_SLOT:
+      // Aguardando callback — ignorar texto
+      await telegram.sendMessage(chatId, '👆 Por favor, utilize os botões acima para continuar.');
+      break;
 
     case State.AUTHENTICATED:
       await handleAuthenticated(chatId, text, session, log);
@@ -228,6 +263,24 @@ async function handleTelegramUpdate(body, requestId) {
 
     case State.AWAITING_CALLBACK_DETAILS:
       await handleCallbackDetails(chatId, text, log);
+      break;
+
+    case State.AWAITING_BOOKING_SLOT:
+      // Usuário digitou em vez de usar os botões — pedir para usar botões
+      await telegram.sendMessage(
+        chatId,
+        '👆 Por favor, selecione um dos horários oferecidos acima clicando nos botões.\n\n' +
+          'Ou digite <b>/cancelar</b> para voltar ao menu principal.'
+      );
+      break;
+
+    case State.AWAITING_DEAL_SELECTION:
+      // Usuário digitou em vez de usar os botões — pedir para usar botões
+      await telegram.sendMessage(
+        chatId,
+        '👆 Por favor, selecione um dos processos listados acima clicando nos botões.\n\n' +
+          'Ou digite <b>/cancelar</b> para voltar ao menu principal.'
+      );
       break;
 
     case State.HANDOFF:
@@ -245,21 +298,83 @@ async function handleTelegramUpdate(body, requestId) {
 // =============================================================================
 
 async function handleCallback(chatId, callbackData, messageId, session, log) {
+  // Handle slot booking callbacks
+  if (callbackData.startsWith('BOOK_SLOT_')) {
+    const slotIndex = parseInt(callbackData.replace('BOOK_SLOT_', ''), 10);
+    await handleSlotSelection(chatId, slotIndex, session, log);
+    return;
+  }
+
+  // Handle deal selection callbacks (Status do Processo)
+  if (callbackData.startsWith('STATUS_DEAL_')) {
+    const dealId = callbackData.replace('STATUS_DEAL_', '');
+    await handleDealSelection(chatId, dealId, session, log);
+    return;
+  }
+
+  // Handle call request callbacks
+  if (callbackData === 'CALL_CONFIRM') {
+    await processCallRequest(chatId, session, session.phone, log);
+    return;
+  }
+  if (callbackData === 'CALL_OTHER_NUMBER') {
+    await telegram.requestContact(
+      chatId,
+      '📱 Por favor, compartilhe o número que deseja receber a ligação:'
+    );
+    updateSession(chatId, State.AWAITING_CALLBACK_DETAILS);
+    return;
+  }
+
+  if (callbackData === 'BOOK_PHONE' || callbackData === 'BOOK_ONLINE') {
+    await telegram.sendMessage(
+      chatId,
+      `🌐 Agende online:\n<a href="https://agenda.bitrix24.site/atendimento-online/">📆 Agenda Online</a>\n\nOu entre em contato: <b>${FALLBACK_PHONE}</b>`
+    );
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+    return;
+  }
+
   switch (callbackData) {
     case CALLBACK.MENU_STATUS:
-      await promptForStatusCpf(chatId);
+      await promptForStatusCpf(chatId, log);
       break;
 
     case CALLBACK.MENU_AGENDAMENTO:
-      await handleAgendamento(chatId, session);
+      await handleAgendamento(chatId, session, log);
       break;
 
     case CALLBACK.MENU_CHAMADA:
-      await promptForCallbackDetails(chatId);
+      await promptForCallbackDetails(chatId, session);
       break;
 
     case CALLBACK.MENU_FALAR_EQUIPE:
       await handleHandoff(chatId, session, log);
+      break;
+
+    case CALLBACK.MENU_BOLETO:
+      await handleBoletoLookup(chatId, session, log);
+      break;
+
+    case CALLBACK.MENU_PERICIA:
+      await handlePericiaLookup(chatId, session, log);
+      break;
+
+    case CALLBACK.MENU_DOCUMENTOS:
+      await handleEnviarDocumentos(chatId, session, log);
+      break;
+
+    case 'PERICIA_CONFIRM_YES':
+      await handlePericiaBooking(chatId, session, log);
+      break;
+
+    case 'PERICIA_CONFIRM_NO':
+      await telegram.sendMessage(
+        chatId,
+        '✅ Tudo bem! Se mudar de ideia, é só acessar o menu novamente.'
+      );
+      await showMainMenu(chatId, getSession(chatId));
       break;
 
     case CALLBACK.MENU_VOLTAR:
@@ -267,8 +382,13 @@ async function handleCallback(chatId, callbackData, messageId, session, log) {
       break;
 
     default:
-      log.info(`Callback desconhecido: ${callbackData}`);
-      await showMainMenu(chatId, session);
+      // Verificar se é um slot de perícia
+      if (callbackData && callbackData.startsWith('PERICIA_SLOT_')) {
+        await handlePericiaSlotSelection(chatId, callbackData, session, log);
+      } else {
+        log.info(`Callback desconhecido: ${callbackData}`);
+        await showMainMenu(chatId, session);
+      }
   }
 }
 
@@ -316,6 +436,12 @@ async function handleContactReceived(chatId, phoneNumber, session, log) {
 
   await telegram.removeKeyboard(chatId, '✅ Número recebido! Obrigado.');
 
+  // Se estamos aguardando detalhes de chamada, processar a solicitação
+  if (session.state === State.AWAITING_CALLBACK_DETAILS) {
+    await processCallRequest(chatId, updated, cleanPhone, log);
+    return;
+  }
+
   // Re-busca a sessão atualizada para evitar stale reference
   if (updated.cpf) {
     await authenticateClient(chatId, updated, log);
@@ -328,6 +454,7 @@ async function handleContactReceived(chatId, phoneNumber, session, log) {
 
 async function handleAwaitingCpf(chatId, text, _firstName, log) {
   const cpfFromMessage = hermesAI.extractCpf(text);
+  log.info(`[CPF] Texto recebido: "${text}" | CPF extraído: ${cpfFromMessage} | Válido: ${cpfFromMessage ? hermesAI.isValidCpf(cpfFromMessage) : 'N/A'}`);
 
   if (!cpfFromMessage || !hermesAI.isValidCpf(cpfFromMessage)) {
     await telegram.sendMessage(
@@ -344,15 +471,8 @@ async function handleAwaitingCpf(chatId, text, _firstName, log) {
 
   await telegram.sendMessage(chatId, '✅ CPF recebido! Estou consultando seu cadastro...');
 
-  // Usa a referência atualizada — não a "session" original (stale)
-  if (updated.phone) {
-    await authenticateClient(chatId, updated, log);
-  } else {
-    await telegram.requestContact(
-      chatId,
-      'Agora, por favor compartilhe seu <b>número de telefone</b> para confirmarmos sua identidade:'
-    );
-  }
+  // Autentica direto com CPF — telefone é opcional
+  await authenticateClient(chatId, updated, log);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +546,78 @@ async function handleAwaitingName(chatId, text, log) {
     );
   }
 
+  // Após cadastro, pede e-mail para atualizar CRM
+  updateSession(chatId, State.AWAITING_EMAIL, {
+    telegramFirstName: session.telegramFirstName || null,
+    telegramLastName: session.telegramLastName || null,
+    telegramUsername: session.telegramUsername || null,
+  });
+
+  await telegram.sendMessage(
+    chatId,
+    'Por favor, informe seu <b>e-mail</b> para mantermos seu cadastro atualizado:'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FASE 1d-2: Aguardando E-mail (atualiza CRM com dados do Telegram)
+// ---------------------------------------------------------------------------
+
+async function handleAwaitingEmail(chatId, text, session, log) {
+  const email = (text || '').trim().toLowerCase();
+  
+  // Validação básica de e-mail
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    await telegram.sendMessage(
+      chatId,
+      '❌ E-mail inválido. Por favor, informe um <b>e-mail válido</b> (ex: nome@email.com):'
+    );
+    return;
+  }
+
+  log.info(`[EMAIL] E-mail recebido: ${email} | Contato ID: ${session.crmContactId}`);
+
+  // Atualiza contato no CRM
+  if (session.crmContactId) {
+    const fields = {
+      EMAIL: [{ VALUE: email, VALUE_TYPE: 'WORK' }],
+    };
+
+    // Adiciona nome do Telegram se disponível
+    if (session.telegramFirstName) {
+      fields.NAME = session.telegramFirstName;
+      if (session.telegramLastName) {
+        fields.LAST_NAME = session.telegramLastName;
+      }
+    }
+
+    // Campo IMOL (messenger) com username do Telegram
+    if (session.telegramUsername) {
+      fields.IMOL = `@${session.telegramUsername}`;
+    } else {
+      // Se não tem username, usa o ID do Telegram
+      fields.IMOL = `Telegram ID: ${chatId}`;
+    }
+
+    const updated = await bitrix24.updateContact(session.crmContactId, fields);
+    if (updated) {
+      log.info(`[EMAIL] Contato ${session.crmContactId} atualizado com sucesso`);
+    } else {
+      log.warn(`[EMAIL] Falha ao atualizar contato ${session.crmContactId}`);
+    }
+  }
+
+  // Atualiza sessão e mostra menu
+  updateSession(chatId, State.AUTHENTICATED, { email });
+  appendHistory(chatId, 'system', `E-mail atualizado: ${email}`);
+
+  await telegram.sendMessage(
+    chatId,
+    `✅ E-mail <b>${email}</b> registrado com sucesso!\n` +
+    `Seus dados estão atualizados em nosso sistema.`
+  );
+
   await showMainMenu(chatId, getSession(chatId));
 }
 
@@ -436,11 +628,15 @@ async function handleAwaitingName(chatId, text, log) {
 async function authenticateClient(chatId, session, log) {
   try {
     await telegram.sendMessage(chatId, '🔍 Consultando nosso sistema...');
+    log.info(`[AUTH] Buscando contato com CPF: ${session.cpf} | Telefone: ${session.phone}`);
 
     const [contacts, leads] = await Promise.all([
       bitrix24.findContactByCpfOrPhone({ cpf: session.cpf, phone: session.phone }),
       bitrix24.findLeadByCpfOrPhone({ cpf: session.cpf, phone: session.phone }),
     ]);
+
+    log.info(`[AUTH] Resultado: ${contacts?.length || 0} contatos, ${leads?.length || 0} leads`);
+    if (contacts?.[0]) log.info(`[AUTH] Contato encontrado: ${contacts[0].NAME} ${contacts[0].LAST_NAME} (ID: ${contacts[0].ID})`);
 
     const foundContact = contacts?.[0];
     const foundLead = leads?.[0];
@@ -448,27 +644,47 @@ async function authenticateClient(chatId, session, log) {
     if (foundContact) {
       const contactName =
         [foundContact.NAME, foundContact.LAST_NAME].filter(Boolean).join(' ') || 'Cliente';
-      const authenticated = updateSession(chatId, State.AUTHENTICATED, {
+      
+      // Extrair telefone do contato no CRM
+      let crmPhone = null;
+      if (foundContact.PHONE && Array.isArray(foundContact.PHONE) && foundContact.PHONE.length > 0) {
+        crmPhone = foundContact.PHONE[0].VALUE || null;
+      }
+      
+      // Salva dados do contato na sessão e pede e-mail
+      updateSession(chatId, State.AWAITING_EMAIL, {
         name: contactName,
         crmContactId: foundContact.ID,
+        phone: crmPhone || session.phone || null,
+        telegramFirstName: session.telegramFirstName || null,
+        telegramLastName: session.telegramLastName || null,
+        telegramUsername: session.telegramUsername || null,
       });
-
-      await telegram.sendMessage(
-        chatId,
-        `✅ <b>Identidade confirmada!</b>\nBem-vindo(a) de volta, ${contactName}.`
-      );
 
       const deals = await bitrix24.getDealsByContact(foundContact.ID);
       if (deals.length > 0) {
-        updateSession(chatId, State.AUTHENTICATED, { crmDealId: deals[0].ID });
+        updateSession(chatId, State.AWAITING_EMAIL, { crmDealId: deals[0].ID });
       }
 
-      await showMainMenu(chatId, getSession(chatId));
+      await telegram.sendMessage(
+        chatId,
+        `✅ <b>Identidade confirmada!</b>\nBem-vindo(a) de volta, ${contactName}.\n\n` +
+        `Por favor, informe seu <b>e-mail</b> para mantermos seu cadastro atualizado:`
+      );
+      return; // Aguarda e-mail antes de mostrar menu
     } else if (foundLead) {
       const leadName = foundLead.NAME || foundLead.TITLE || 'Cliente';
+      
+      // Extrair telefone do lead no CRM
+      let crmPhone = null;
+      if (foundLead.PHONE && Array.isArray(foundLead.PHONE) && foundLead.PHONE.length > 0) {
+        crmPhone = foundLead.PHONE[0].VALUE || null;
+      }
+      
       updateSession(chatId, State.AUTHENTICATED, {
         name: leadName,
         crmContactId: foundLead.ID,
+        phone: crmPhone || session.phone || null,
       });
 
       await telegram.sendMessage(
@@ -488,6 +704,9 @@ async function authenticateClient(chatId, session, log) {
         crmContactId: null,
         crmDealId: null,
         _pendingCreate: true,
+        telegramFirstName: session.telegramFirstName || null,
+        telegramLastName: session.telegramLastName || null,
+        telegramUsername: session.telegramUsername || null,
       });
     }
   } catch (err) {
@@ -497,6 +716,304 @@ async function authenticateClient(chatId, session, log) {
       `⚠️ No momento nosso sistema de consultas está em manutenção. ` +
         `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
     );
+  }
+}
+
+// =============================================================================
+// OPÇÃO: Enviar Certidão de Nascimento / Documentos
+// =============================================================================
+
+async function handleEnviarDocumentos(chatId, session, log) {
+  const clientName = session.name || 'Cliente';
+
+  await telegram.sendMessage(
+    chatId,
+    `📎 <b>Envio de Documentos</b>\n\n` +
+    `<b>${clientName}</b>, para enviar sua certidão de nascimento ou outros documentos,\n` +
+    `basta enviar o arquivo diretamente aqui nesta conversa.\n\n` +
+    `⚠️ <b>ATENÇÃO:</b> As fotos devem ser tiradas corretamente para que o INSS aceite\n` +
+    `e seu processo <b>não entre em exigência</b>.\n\n` +
+    `🎥 <b>Assista este tutorial antes de enviar:</b>\n` +
+    `<a href="https://vimeo.com/1177468232?share=copy&fl=sv&fe=ci">▶️ Como tirar fotos dos documentos</a>\n\n` +
+    `📄 <b>Formatos aceitos:</b>\n` +
+    `• PDF, JPG, PNG, DOC, DOCX\n\n` +
+    `📋 <b>Documentos comuns:</b>\n` +
+    `• Certidão de Nascimento\n` +
+    `• RG / CNH\n` +
+    `• CPF\n` +
+    `• Comprovante de residência\n` +
+    `• Laudos e exames médicos\n\n` +
+    `✅ Envie <b>um documento por vez</b> para garantir o recebimento correto.`
+  );
+
+  updateSession(chatId, State.AUTHENTICATED);
+}
+
+async function handleDocumentoRecebido(chatId, document, photo, caption, session, log) {
+  const clientName = session.name || 'Cliente';
+  const cpf = session.cpf || 'Não informado';
+  const contactId = session.crmContactId || 'N/A';
+
+  log.info(`[DOC] Documento recebido de ${clientName} (CPF: ${cpf}, ContactID: ${contactId})`);
+
+  // Obter link do documento/foto no Telegram
+  let docLink = '';
+  try {
+    const fileId = photo ? photo[photo.length - 1].file_id : document.file_id;
+    const fileInfo = await telegram.getFile(fileId);
+    docLink = telegram.getFileUrl(fileInfo.file_path);
+  } catch (err) {
+    log.error(`[DOC] Erro ao obter link do documento: ${err.message}`);
+  }
+
+  // Montar link do contato no Bitrix24
+  const bitrixContactUrl = `https://brandaocorrea.bitrix24.com.br/crm/contact/details/${contactId}/`;
+
+  // Montar mensagem URGENTE para operadores
+  const urgentMessage = 
+    `🚨 <b>DOCUMENTO RECEBIDO URGENTE</b> 🚨\n\n` +
+    `👤 <b>Cliente:</b> ${clientName}\n` +
+    `📋 <b>CPF:</b> ${cpf}\n` +
+    `🔗 <b>Cadastro Bitrix24:</b> <a href="${bitrixContactUrl}">Abrir contato</a>\n` +
+    `${docLink ? `📎 <b>Link do documento:</b> <a href="${docLink}">Abrir arquivo</a>\n` : ''}` +
+    `${caption ? `\n💬 <b>Observação do cliente:</b> ${caption}` : ''}`;
+
+  // Enviar mensagem URGENTE via Bitrix24 IM (chat geral + Rodrigo + Larissa)
+  const bitrixDestinations = ['chat1', '1', '76239'];
+  for (const dialogId of bitrixDestinations) {
+    try {
+      await bitrix24.sendBitrix24Message(dialogId, 
+        `[B]🚨 DOCUMENTO RECEBIDO URGENTE 🚨[/B]\n\n` +
+        `[B]Cliente:[/B] ${clientName}\n` +
+        `[B]CPF:[/B] ${cpf}\n` +
+        `[B]Cadastro Bitrix24:[/B] ${bitrixContactUrl}\n` +
+        `${docLink ? `[B]Link do documento:[/B] ${docLink}\n` : ''}` +
+        `${caption ? `\n[B]Observação do cliente:[/B] ${caption}` : ''}`
+      );
+      log.info(`[DOC] Alerta enviado via Bitrix24 IM para ${dialogId}`);
+    } catch (err) {
+      log.error(`[DOC] Erro ao enviar alerta para ${dialogId}: ${err.message}`);
+    }
+  }
+
+  // Confirmar recebimento ao cliente
+  await telegram.sendMessage(
+    chatId,
+    `✅ <b>Documento recebido com sucesso!</b>\n\n` +
+    `Recebemos seu documento e nossa equipe foi notificada.\n` +
+    `Você receberá um retorno em breve.\n\n` +
+    `📌 Se precisar enviar mais documentos, envie um por vez.`
+  );
+
+  await showMainMenu(chatId, getSession(chatId));
+}
+
+// =============================================================================
+// OPÇÃO: Consultar Data da Perícia Médica
+// =============================================================================
+
+async function handlePericiaBooking(chatId, session, log) {
+  await telegram.sendMessage(chatId, '📅 Buscando horários disponíveis para orientação...');
+
+  try {
+    // Buscar bookings existentes para evitar conflitos
+    const existingBookings = await bitrix24.getExistingBookings();
+    const slots = bitrix24.generatePericiaSlots(existingBookings);
+
+    if (!slots || slots.length === 0) {
+      await telegram.sendMessage(
+        chatId,
+        '😔 Infelizmente não há horários disponíveis no momento.\n\n' +
+        'Por favor, entre em contato pelo telefone para agendar manualmente:\n' +
+        '☎️ <b>(65) 3052-5278</b>'
+      );
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    // Salvar slots na sessão
+    updateSession(chatId, State.AWAITING_PERICIA_SLOT, { _periciaSlots: slots });
+
+    // Montar botões com as 3 opções
+    const buttons = slots.map((slot, index) => [{
+      text: `📅 ${slot.label}`,
+      callback_data: `PERICIA_SLOT_${index}`,
+    }]);
+
+    await telegram.sendInlineKeyboard(
+      chatId,
+      '📋 <b>Horários disponíveis para Orientação Pericial:</b>\n\n' +
+      'Escolha o melhor dia e horário para você:',
+      buttons
+    );
+
+  } catch (err) {
+    log.error(`[PERICIA] Erro ao buscar slots: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      '⚠️ Não foi possível buscar horários no momento.\n\n' +
+      'Por favor, agende pelo link abaixo ou entre em contato pelo telefone:\n' +
+      '🔗 <a href="https://documentosbrandaocorrea.bitrix24.site/agendamento/">Agendar Online</a>\n' +
+      '☎️ <b>(65) 3052-5278</b>'
+    );
+    await showMainMenu(chatId, getSession(chatId));
+  }
+}
+
+async function handlePericiaSlotSelection(chatId, callbackData, session, log) {
+  const slotIndex = parseInt(callbackData.replace('PERICIA_SLOT_', ''));
+  const slots = session._periciaSlots;
+
+  if (!slots || isNaN(slotIndex) || slotIndex < 0 || slotIndex >= slots.length) {
+    await telegram.sendMessage(chatId, '❌ Opção inválida. Por favor, tente novamente.');
+    await showMainMenu(chatId, getSession(chatId));
+    return;
+  }
+
+  const selectedSlot = slots[slotIndex];
+  const dealId = session._periciaDealId;
+  const contactId = session.crmContactId;
+
+  await telegram.sendMessage(
+    chatId,
+    `📅 Agendando orientação para <b>${selectedSlot.label}</b>...`
+  );
+
+  try {
+    const clientName = session.name || 'Cliente';
+    const bookingName = `${clientName} - Orientação Perícia`;
+
+    const bookingResult = await bitrix24.createBooking({
+      name: bookingName,
+      resourceId: selectedSlot.resourceId,
+      fromTs: selectedSlot.fromTs,
+      toTs: selectedSlot.toTs,
+      description: `Orientação pré-perícia agendada via bot`,
+      contactId: contactId,
+      dealId: dealId,
+    });
+
+    if (bookingResult) {
+      await telegram.sendMessage(
+        chatId,
+        `✅ <b>Agendamento confirmado!</b>\n\n` +
+        `📅 <b>Data:</b> ${selectedSlot.label}\n` +
+        `📍 <b>Modalidade:</b> Online ou Presencial\n\n` +
+        `🔗 O link da reunião será enviado <b>10 minutos antes</b> do horário agendado.\n\n` +
+        `📌 <b>Orientações importantes:</b>\n` +
+        `• Tenha em mãos todos os seus documentos médicos\n` +
+        `• Prepare suas dúvidas sobre a perícia\n` +
+        `• O advogado irá orientá-lo sobre o que fazer e falar\n\n` +
+        `🤩 Compareça no horário agendado. Boa sorte!`
+      );
+    } else {
+      throw new Error('Falha ao criar booking');
+    }
+  } catch (err) {
+    log.error(`[PERICIA] Erro ao criar booking: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      '⚠️ Não foi possível confirmar o agendamento automaticamente.\n\n' +
+      'Por favor, agende pelo link abaixo ou entre em contato pelo telefone:\n' +
+      '🔗 <a href="https://documentosbrandaocorrea.bitrix24.site/agendamento/">Agendar Online</a>\n' +
+      '☎️ <b>(65) 3052-5278</b>'
+    );
+  }
+
+  // Limpar dados temporários e voltar ao menu
+  updateSession(chatId, State.AUTHENTICATED, {
+    _periciaSlots: null,
+    _periciaDealId: null,
+    _periciaDetails: null,
+  });
+  await showMainMenu(chatId, getSession(chatId));
+}
+
+// =============================================================================
+// OPÇÃO: Consultar Data da Perícia Médica
+// =============================================================================
+
+async function handlePericiaLookup(chatId, session, log) {
+  const contactId = session.crmContactId;
+
+  if (!contactId) {
+    await telegram.sendMessage(
+      chatId,
+      '❌ Não foi possível identificar seu cadastro. Por favor, informe seu <b>CPF</b> novamente.'
+    );
+    return;
+  }
+
+  await telegram.sendMessage(chatId, '🔍 Buscando informações sobre sua perícia médica...');
+
+  try {
+    const deals = await bitrix24.getDealsByContact(contactId);
+
+    if (!deals || deals.length === 0) {
+      await telegram.sendMessage(
+        chatId,
+        '📋 Não encontramos processos vinculados ao seu cadastro no momento.\n\n' +
+        'Se você acredita que isso é um erro, entre em contato pelo telefone: <b>' + FALLBACK_PHONE + '</b>.'
+      );
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    // Buscar detalhes completos — encontrar PRIMEIRA perícia agendada
+    let periciaDeal = null;
+    let periciaDetails = null;
+
+    for (const deal of deals) {
+      const dealDetails = await bitrix24.getDealDetails(deal.ID);
+      if (!dealDetails) continue;
+
+      const dataPericia = dealDetails.UF_CRM_1747855086;
+      if (dataPericia) {
+        periciaDeal = deal;
+        periciaDetails = dealDetails;
+        break; // Apenas a primeira perícia
+      }
+    }
+
+    if (!periciaDetails) {
+      await telegram.sendMessage(
+        chatId,
+        '📋 Não encontramos nenhuma perícia médica agendada nos seus processos no momento.\n\n' +
+        'Caso tenha dúvidas, entre em contato pelo telefone: <b>' + FALLBACK_PHONE + '</b>.'
+      );
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    // Enviar bloco de informações da perícia
+    const clientName = session.name || 'Cliente';
+    const periciaBlock = bitrix24.formatPericiaBlock(periciaDetails, clientName);
+    await telegram.sendMessage(chatId, periciaBlock);
+
+    // Salvar dados da perícia na sessão para uso posterior
+    updateSession(chatId, State.AWAITING_PERICIA_CONFIRM, {
+      _periciaDealId: periciaDeal.ID,
+      _periciaDetails: periciaDetails,
+    });
+
+    // Perguntar se quer agendar orientação
+    await telegram.sendInlineKeyboard(
+      chatId,
+      `💼 <b>${clientName}</b>, agora precisamos agendar a <b>orientação</b> que você deve fazer antes de realizar a perícia.\n\n` +
+      `Deseja agendar agora?`,
+      [
+        [{ text: '✅  SIM, QUERO AGENDAR  ✅', callback_data: 'PERICIA_CONFIRM_YES' }],
+        [{ text: 'Não', callback_data: 'PERICIA_CONFIRM_NO' }],
+      ]
+    );
+
+  } catch (err) {
+    log.error(`[PERICIA] Erro ao buscar perícia: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      '⚠️ Ocorreu um erro ao consultar suas informações. Por favor, tente novamente mais tarde.'
+    );
+    await showMainMenu(chatId, getSession(chatId));
   }
 }
 
@@ -511,7 +1028,7 @@ async function handleAuthenticated(chatId, text, session, log) {
 
   switch (intent) {
     case hermesAI.Intent.STATUS_PROCESSO:
-      await promptForStatusCpf(chatId);
+      await promptForStatusCpf(chatId, log);
       break;
 
     case hermesAI.Intent.AGENDAMENTO:
@@ -519,7 +1036,11 @@ async function handleAuthenticated(chatId, text, session, log) {
       break;
 
     case hermesAI.Intent.SOLICITAR_CHAMADA:
-      await promptForCallbackDetails(chatId);
+      await promptForCallbackDetails(chatId, session);
+      break;
+
+    case hermesAI.Intent.BOLETO:
+      await handleBoletoLookup(chatId, session, log);
       break;
 
     case hermesAI.Intent.FALAR_EQUIPE:
@@ -567,7 +1088,10 @@ async function showMainMenu(chatId, session) {
     [{ text: '📋 Status do Processo', callback_data: CALLBACK.MENU_STATUS }],
     [{ text: '📅 Agendamento de Horário', callback_data: CALLBACK.MENU_AGENDAMENTO }],
     [{ text: '📞 Solicitar uma Chamada', callback_data: CALLBACK.MENU_CHAMADA }],
+    [{ text: '💳 2ª Via de Boleto', callback_data: CALLBACK.MENU_BOLETO }],
     [{ text: '👩‍💼 Falar com a Equipe', callback_data: CALLBACK.MENU_FALAR_EQUIPE }],
+    [{ text: '🩺 Consultar Data da Perícia', callback_data: CALLBACK.MENU_PERICIA }],
+    [{ text: '📎 Enviar Documentos', callback_data: CALLBACK.MENU_DOCUMENTOS }],
   ];
 
   await telegram.sendInlineKeyboard(
@@ -584,7 +1108,15 @@ async function showMainMenu(chatId, session) {
 // OPÇÃO 1: Status do Processo
 // =============================================================================
 
-async function promptForStatusCpf(chatId) {
+async function promptForStatusCpf(chatId, log) {
+  const session = getSession(chatId);
+
+  // Se já tem CPF na sessão, busca direto sem pedir novamente
+  if (session.cpf) {
+    await handleStatusLookup(chatId, session.cpf, log);
+    return;
+  }
+
   updateSession(chatId, State.AWAITING_STATUS_CPF);
 
   await telegram.sendMessage(
@@ -595,6 +1127,11 @@ async function promptForStatusCpf(chatId) {
 }
 
 async function handleStatusLookup(chatId, text, log) {
+  // Se o texto é um deal ID (callback interno), buscar direto
+  if (/^\d+$/.test(text) && text.length < 10) {
+    // Pode ser CPF ou deal ID — tentar como CPF primeiro
+  }
+
   const cpf = hermesAI.extractCpf(text);
 
   if (!cpf) {
@@ -615,7 +1152,7 @@ async function handleStatusLookup(chatId, text, log) {
       await telegram.sendMessage(
         chatId,
         '❌ Não encontramos processos vinculados a este CPF.\n\n' +
-          'Verifique se o número está correto ou entre em contato pelo telefone/WhatsApp: ' +
+          'Verifique se o número está correto ou entre em contato pelo telefone fixo: ' +
           `<b>${FALLBACK_PHONE}</b>.`
       );
       updateSession(chatId, State.AUTHENTICATED);
@@ -631,35 +1168,102 @@ async function handleStatusLookup(chatId, text, log) {
         'ℹ️ Não há processos ativos vinculados ao seu CPF no momento.\n\n' +
           'Se acredita que isso é um erro, por favor entre em contato com nossa equipe.'
       );
-    } else {
-      const dealList = deals
-        .map((deal, i) => {
-          const date = deal.DATE_CREATE
-            ? new Date(deal.DATE_CREATE).toLocaleDateString('pt-BR')
-            : 'N/D';
-          return (
-            `<b>${i + 1}.</b> ${deal.TITLE || 'Sem título'}\n` +
-            `    📌 Estágio: <b>${deal.STAGE_ID || 'Não informado'}</b>\n` +
-            `    📅 Abertura: ${date}`
-          );
-        })
-        .join('\n\n');
-
-      await telegram.sendMessage(
-        chatId,
-        `📋 <b>Processos Encontrados</b>\n\n${dealList}\n\n` +
-          `<i>Para mais detalhes sobre um processo específico, entre em contato com nossa equipe.</i>`
-      );
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
     }
 
-    updateSession(chatId, State.AUTHENTICATED);
-    await showMainMenu(chatId, getSession(chatId));
+    // Se tem apenas 1 negócio, mostrar detalhes direto
+    if (deals.length === 1) {
+      const deal = deals[0];
+      const details = bitrix24.formatDealDetails(deal, session.name || 'Cliente');
+      await telegram.sendMessage(
+        chatId,
+        `📋 <b>Status do Processo</b>\n\n${details}`
+      );
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    // Se tem mais de 1 negócio, mostrar lista para seleção
+    const summaryList = deals
+      .slice(0, 5)
+      .map((deal, i) => bitrix24.formatDealSummary(deal, i))
+      .join('\n\n');
+
+    const moreText = deals.length > 5
+      ? `\n\n<i>Mostrando 5 de ${deals.length} processos.</i>`
+      : '';
+
+    // Salvar deals na sessão para usar no callback
+    updateSession(chatId, State.AWAITING_DEAL_SELECTION, {
+      _dealsList: deals.slice(0, 5),
+    });
+
+    // Botões para cada negócio
+    const buttons = deals.slice(0, 5).map((deal, i) => {
+      const servicoRaw = deal.UF_CRM_1731420853730 || deal.TITLE || `#${deal.ID}`;
+      // Se for ID numérico, usar o título do deal como fallback no botão
+      const servico = /^\d+$/.test(String(servicoRaw)) ? (deal.TITLE || `Processo #${deal.ID}`) : servicoRaw;
+      const { emoji } = bitrix24.getStageStatus(deal);
+      return [{
+        text: `${emoji} ${servico.length > 40 ? servico.substring(0, 40) + '...' : servico}`,
+        callback_data: `STATUS_DEAL_${deal.ID}`,
+      }];
+    });
+
+    await telegram.sendInlineKeyboard(
+      chatId,
+      `📋 <b>Seus Processos</b> — Selecione para ver detalhes:\n\n${summaryList}${moreText}`,
+      buttons
+    );
+
   } catch (err) {
     log.error(`Erro ao consultar processos: ${err.message}`);
     await telegram.sendMessage(
       chatId,
       `⚠️ No momento nosso sistema de consultas está em manutenção. ` +
-        `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
+        `Por favor, entre em contato pelo telefone fixo: <b>${FALLBACK_PHONE}</b>.`
+    );
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Handler: Seleção de negócio (Status do Processo)
+// ---------------------------------------------------------------------------
+
+async function handleDealSelection(chatId, dealId, session, log) {
+  try {
+    await telegram.sendMessage(chatId, '🔍 Buscando detalhes do processo...');
+
+    // Buscar detalhes completos do deal
+    const deal = await bitrix24.getDealDetails(dealId);
+
+    if (!deal || !deal.ID) {
+      await telegram.sendMessage(chatId, '❌ Processo não encontrado. Tente novamente.');
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    const details = bitrix24.formatDealDetails(deal, session.name || 'Cliente');
+
+    await telegram.sendMessage(
+      chatId,
+      `📋 <b>Status do Processo</b>\n\n${details}`
+    );
+
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+
+  } catch (err) {
+    log.error(`[Status] Erro ao buscar deal ${dealId}: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ Erro ao consultar processo. Por favor, entre em contato pelo telefone fixo: <b>${FALLBACK_PHONE}</b>.`
     );
     updateSession(chatId, State.AUTHENTICATED);
     await showMainMenu(chatId, getSession(chatId));
@@ -670,86 +1274,336 @@ async function handleStatusLookup(chatId, text, log) {
 // OPÇÃO 2: Agendamento de Horário
 // =============================================================================
 
-async function handleAgendamento(chatId, session) {
+async function handleAgendamento(chatId, session, log) {
   try {
-    const bookingLink = bitrix24.getBookingLink();
+    await telegram.sendMessage(chatId, '📅 <b>Agendamento de Horário</b>\n\nVerificando horários disponíveis...');
 
-    await telegram.sendMessage(
-      chatId,
-      '📅 <b>Agendamento de Horário</b>\n\n' +
-        `Para agendar uma consulta, acesse nossa agenda online:\n` +
-        `<a href="${bookingLink}">📆 Agenda Online — Brandão Correa</a>\n\n` +
-        `<i>Ao clicar no link, você poderá escolher o melhor dia e horário disponível.</i>`
-    );
+    // 1. Garantir que o cliente tem um deal ativo
+    let dealId = session.crmDealId;
+    console.log(`[AGENDAMENTO] dealId inicial: ${dealId}, contactId: ${session.crmContactId}`);
+    
+    if (!dealId && session.crmContactId) {
+      // Buscar deals existentes do contato
+      const deals = await bitrix24.getDealsByContact(session.crmContactId);
+      const activeDeal = deals.find(d => !d.STAGE_ID?.includes('WON') && !d.STAGE_ID?.includes('LOSE'));
+      
+      if (activeDeal) {
+        dealId = activeDeal.ID;
+        updateSession(chatId, session.state, { crmDealId: dealId });
+      } else {
+        // Criar novo deal para agendamento
+        log.info(`[Agendamento] Criando novo deal para contato ${session.crmContactId}`);
+        dealId = await bitrix24.createDeal({
+          title: `Agendamento - ${session.name || 'Cliente'} - ${new Date().toLocaleDateString('pt-BR')}`,
+          contactId: session.crmContactId,
+          categoryId: 0, // Funil padrão
+        });
+        updateSession(chatId, session.state, { crmDealId: dealId });
+        log.info(`[Agendamento] Deal criado: ${dealId}`);
+      }
+    }
 
-    const slots = await bitrix24.getAvailableSlots();
-    if (slots && slots.length > 0) {
-      const slotInfo = slots
-        .slice(0, 5)
-        .map((s) => `• ${s.NAME || 'Horário disponível'}`)
-        .join('\n');
+    // 2. Buscar bookings existentes nas salas de vídeo
+    const today = new Date();
+    const endDate = new Date(today);
+    endDate.setDate(endDate.getDate() + 7);
+    
+    const fromDate = today.toISOString().split('T')[0];
+    const toDate = endDate.toISOString().split('T')[0];
+    
+    const existingBookings = await bitrix24.getExistingBookings(fromDate, toDate);
+    log.info(`[Agendamento] ${existingBookings.length} bookings existentes nas salas`);
+
+    // 3. Gerar slots disponíveis (3 opções no próximo dia útil)
+    const availableSlots = bitrix24.generateAvailableSlots(existingBookings);
+    
+    if (availableSlots.length === 0) {
       await telegram.sendMessage(
         chatId,
-        `📆 <b>Próximos horários disponíveis:</b>\n${slotInfo}`
+        '😔 <b>Nenhum horário disponível no próximo dia útil.</b>\n\n' +
+          'Você pode agendar online:\n' +
+          `<a href="https://agenda.bitrix24.site/atendimento-online/">📆 Agenda Online</a>\n\n` +
+          `Ou entre em contato: <b>${FALLBACK_PHONE}</b>`
       );
+      await showMainMenu(chatId, getSession(chatId));
+      return;
     }
+
+    // 4. Salvar slots na sessão para usar no callback
+    updateSession(chatId, State.AWAITING_BOOKING_SLOT, {
+      _availableSlots: availableSlots,
+      _bookingDealId: dealId,
+    });
+
+    // 5. Mostrar opções com botões inline
+    const buttons = availableSlots.map((slot, i) => [{
+      text: `📅 ${slot.label}`,
+      callback_data: `BOOK_SLOT_${i}`,
+    }]);
+    
+    // Adicionar botão "Agendar online"
+    buttons.push([{
+      text: '🌐 Agendar online',
+      callback_data: 'BOOK_ONLINE',
+    }]);
+
+    const nextDay = availableSlots[0]?.label?.split(' às ')[0] || 'próximo dia útil';
+
+    await telegram.sendInlineKeyboard(
+      chatId,
+      `📋 <b>Horários disponíveis para ${nextDay}:</b>\n\nEscolha uma opção abaixo:`,
+      buttons
+    );
+
   } catch (err) {
-    logger.error(`[Agendamento] Erro: ${err.message}`);
+    log.error(`[Agendamento] Erro: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠️ No momento o sistema de agendamento está em manutenção. ` +
-        `Por favor, entre em contato pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
+      `⚠️ No momento o sistema de agendamento está em manutenção.\n\n` +
+        `Você pode agendar online:\n` +
+        `<a href="https://agenda.bitrix24.site/atendimento-online/">📆 Agenda Online</a>\n\n` +
+        `Ou entre em contato: <b>${FALLBACK_PHONE}</b>`
     );
+    await showMainMenu(chatId, getSession(chatId));
   }
+}
 
-  await showMainMenu(chatId, session);
+// ---------------------------------------------------------------------------
+// Handler: Seleção de slot de agendamento
+// ---------------------------------------------------------------------------
+
+async function handleSlotSelection(chatId, slotIndex, session, log) {
+  try {
+    const slots = session._availableSlots || [];
+    const selectedSlot = slots[slotIndex];
+
+    if (!selectedSlot) {
+      await telegram.sendMessage(chatId, '❌ Horário inválido. Por favor, tente novamente.');
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    console.log(`[BOOKING] Slot selecionado: índice=${slotIndex}`, JSON.stringify(selectedSlot));
+    await telegram.sendMessage(chatId, '✅ <b>Confirmando agendamento...</b>');
+
+    // 1. Tentar criar booking — se falhar, tentar próximo slot
+    const dealId = session._bookingDealId;
+    const contactId = session.crmContactId;
+
+    let bookingId = null;
+    let usedSlot = selectedSlot;
+
+    // Tentar o slot selecionado primeiro, depois os outros
+    const slotsToTry = [selectedSlot, ...slots.filter((_, i) => i !== slotIndex)];
+
+    for (const slot of slotsToTry) {
+      try {
+        // Descrição detalhada para o booking e timeline
+        const description = [
+          `Agendamento via bot Telegram`,
+          `Cliente: ${session.name || 'Não identificado'}`,
+          `CPF: ${session.cpf || 'Não informado'}`,
+          `Sala: ${slot.roomName}`,
+          dealId ? `Deal ID: #${dealId}` : '',
+          contactId ? `Contact ID: #${contactId}` : '',
+        ].filter(Boolean).join('\n');
+
+        bookingId = await bitrix24.createBooking({
+          name: `${session.name || 'Cliente'} - ${slot.roomName}`,
+          resourceId: slot.resourceId,
+          fromTs: slot.fromTs,
+          toTs: slot.toTs,
+          description,
+          contactId: contactId || undefined,
+          dealId: dealId || undefined,
+        });
+        usedSlot = slot;
+        break; // Sucesso!
+      } catch (bookingErr) {
+        console.log(`[BOOKING] Slot ${slot.label} falhou: ${bookingErr.message} — tentando próximo...`);
+        continue;
+      }
+    }
+
+    if (!bookingId) {
+      // Todos os slots falharam — oferecer link manual
+      await telegram.sendMessage(
+        chatId,
+        `⚠️ Não foi possível agendar automaticamente. Os horários podem estar ocupados.\n\n` +
+          `Você pode agendar manualmente:\n` +
+          `<a href="https://documentosbrandaocorrea.bitrix24.site/agendamento/">📆 Agendar Online</a>\n\n` +
+          `Ou entre em contato: <b>${FALLBACK_PHONE}</b>`
+      );
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    log.info(`[Agendamento] Booking criado: ${bookingId} | Slot: ${usedSlot.label} | Deal: ${dealId} | Contact: ${session.crmContactId}`);
+    console.log(`[BOOKING] Confirmado: bookingId=${bookingId}, dealId=${dealId}, contactId=${session.crmContactId}`);
+
+    // 2. Atualizar sessão
+    updateSession(chatId, State.AUTHENTICATED, {
+      _availableSlots: null,
+      _bookingDealId: null,
+    });
+
+    // 3. Confirmar para o cliente
+    const dealInfo = dealId ? `📋 <b>Processo vinculado:</b> #${dealId}\n` : '';
+    await telegram.sendMessage(
+      chatId,
+      `✅ <b>Agendamento confirmado!</b>\n\n` +
+        `📅 <b>${usedSlot.label}</b>\n` +
+        `📍 Sala: ${usedSlot.roomName}\n\n` +
+        dealInfo +
+        `\nVocê receberá uma confirmação. Se precisar reagendar, entre em contato.` +
+        `\n\n📞 <b>${FALLBACK_PHONE}</b>`
+    );
+
+    await showMainMenu(chatId, getSession(chatId));
+
+  } catch (err) {
+    log.error(`[Agendamento] Erro ao confirmar slot: ${err.message}`);
+    console.error(`[BOOKING] Erro geral: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ Erro ao confirmar agendamento. Você pode agendar online:\n` +
+        `<a href="https://documentosbrandaocorrea.bitrix24.site/agendamento/">📆 Agenda Online</a>\n\n` +
+        `Ou entre em contato: <b>${FALLBACK_PHONE}</b>`
+    );
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+  }
 }
 
 // =============================================================================
 // OPÇÃO 3: Solicitar uma Chamada
 // =============================================================================
 
-async function promptForCallbackDetails(chatId) {
-  updateSession(chatId, State.AWAITING_CALLBACK_DETAILS);
+async function promptForCallbackDetails(chatId, session) {
+  // Verificar se já tem telefone no cadastro
+  const phone = session.phone;
 
-  await telegram.sendMessage(
-    chatId,
-    '📞 <b>Solicitação de Chamada</b>\n\n' +
-      'Por favor, informe:\n' +
-      '• O <b>número de telefone</b> para retorno\n' +
-      '• Seu <b>melhor horário</b> para receber a ligação\n\n' +
-      '<i>Exemplo: "11 99999-8888, amanhã entre 14h e 16h"</i>'
-  );
+  if (phone) {
+    // Já tem telefone — perguntar se quer usar esse ou outro
+    await telegram.sendInlineKeyboard(
+      chatId,
+      '📞 <b>Solicitação de Chamada</b>\n\n' +
+        `Encontramos o número <b>${phone}</b> no seu cadastro.\n\n` +
+        'Deseja receber a ligação neste número?',
+      [
+        [{ text: `✅ Sim, ligar no ${phone}`, callback_data: 'CALL_CONFIRM' }],
+        [{ text: '📱 Usar outro número', callback_data: 'CALL_OTHER_NUMBER' }],
+        [{ text: '📅 Agendar Online (MeLigue)', url: 'https://agenda.bitrix24.site/meligue/' }],
+      ]
+    );
+  } else {
+    // Não tem telefone — pedir para informar
+    await telegram.sendMessage(
+      chatId,
+      '📞 <b>Solicitação de Chamada</b>\n\n' +
+        'Para prosseguir, por favor informe o número de telefone onde deseja receber a ligação:\n\n' +
+        '💡 <i>Envie o número no formato: (XX) XXXXX-XXXX</i>\n\n' +
+        '🔗 <b>Ou agende uma ligação online:</b>\n' +
+        '<a href="https://agenda.bitrix24.site/meligue/">📅 Agendar Ligação (MeLigue)</a>'
+    );
+    updateSession(chatId, State.AWAITING_CALLBACK_DETAILS);
+  }
 }
 
 async function handleCallbackDetails(chatId, text, log) {
+  // Extrair telefone do texto ou do contato compartilhado
+  const session = getSession(chatId);
+  let phone = session.phone;
+
+  // Se o texto parece um telefone, usar ele
+  const phoneMatch = text?.match(/(\d{2}\s?\d{4,5}-?\d{4})/);
+  if (phoneMatch) {
+    phone = phoneMatch[1];
+  }
+
+  if (!phone) {
+    await telegram.sendMessage(chatId, '❌ Não consegui identificar o número. Tente novamente.');
+    return;
+  }
+
+  await processCallRequest(chatId, session, phone, log);
+}
+
+/**
+ * Processa a solicitação de chamada: registra no CRM e notifica a equipe.
+ */
+async function processCallRequest(chatId, session, phone, log) {
   try {
-    await telegram.sendMessage(chatId, '📞 Registrando sua solicitação de chamada...');
+    const clientName = session.name || 'Cliente não identificado';
+    const contactId = session.crmContactId || 'N/A';
+    const telegramUser = session.telegramUsername ? `@${session.telegramUsername}` : `ID: ${chatId}`;
+    const bitrixContactUrl = `https://brandaocorrea.bitrix24.com.br/crm/contact/details/${contactId}/`;
 
-    const phoneMatch = text.match(/(\d{2}\s?\d{4,5}-?\d{4})/);
-    const session = getSession(chatId);
-    const callbackPhone = phoneMatch ? phoneMatch[1] : session.phone || 'Não informado';
+    // Atualizar telefone na sessão
+    updateSession(chatId, session.state, { phone });
 
-    await bitrix24.createCallActivity({
-      ownerId: config.bitrix24.operatorAliceId,
-      contactId: session.crmContactId || undefined,
-      dealId: session.crmDealId || undefined,
-      phone: callbackPhone,
-    });
+    // 1. Registrar no timeline do contato/deal
+    try {
+      await bitrix24.createCallActivity({
+        ownerId: config.bitrix24.operatorAliceId,
+        contactId: session.crmContactId || undefined,
+        dealId: session.crmDealId || undefined,
+        phone,
+      });
+    } catch (crmErr) {
+      log.warn(`[Chamada] Falha ao registrar no CRM: ${crmErr.message}`);
+    }
 
+    // 2. Enviar mensagem URGENTE via Bitrix24 IM (chat geral + Rodrigo + Larissa)
+    const bitrixDestinations = ['chat1', '1', '76239'];
+    for (const dialogId of bitrixDestinations) {
+      try {
+        await bitrix24.sendBitrix24Message(dialogId, 
+          `[B]🚨📞 SOLICITAÇÃO DE LIGAÇÃO URGENTE! 📞🚨[/B]\n\n` +
+          `[B]Cliente:[/B] ${clientName}\n` +
+          `[B]Telegram:[/B] ${telegramUser}\n` +
+          `[B]Telefone:[/B] ${phone}\n` +
+          `[B]Cadastro Bitrix24:[/B] ${bitrixContactUrl}\n\n` +
+          `[B]⚠️ O cliente solicitou uma ligação telefônica![/B]\n` +
+          `[B]Prioridade: ALTA[/B]`
+        );
+        log.info(`[Chamada] Alerta enviado via Bitrix24 IM para ${dialogId}`);
+      } catch (err) {
+        log.error(`[Chamada] Erro ao notificar ${dialogId}: ${err.message}`);
+      }
+    }
+
+    // 3. Postar no workgroup 12
+    try {
+      const postTitle = `📞 Solicitação de Chamada - ${clientName}`;
+      const postMessage = `[B]📞 Solicitação de Ligação[/B]\n\n` +
+        `[B]Cliente:[/B] ${clientName}\n` +
+        `[B]Telegram:[/B] ${telegramUser}\n` +
+        `[B]Telefone:[/B] ${phone}\n` +
+        `[B]Contato:[/B] ${contactId}`;
+      await bitrix24.postToWorkgroup(12, postTitle, postMessage);
+      log.info('[Chamada] Post criado no workgroup 12');
+    } catch (err) {
+      log.error(`[Chamada] Erro ao postar no workgroup: ${err.message}`);
+    }
+
+    // 4. Confirmar ao cliente
     await telegram.sendMessage(
       chatId,
-      '✅ <b>Solicitação registrada com sucesso!</b>\n\n' +
-        `Nossa equipe entrará em contato pelo telefone <b>${callbackPhone}</b>.\n` +
-        `⏰ Prioridade <b>Alta</b> — retornaremos o mais breve possível.\n\n` +
-        `<i>Detalhes da sua solicitação: "${text}"</i>`
+      `✅ <b>Solicitação registrada!</b>\n\n` +
+        `📞 Telefone: <b>${phone}</b>\n\n` +
+        `Nossa equipe foi notificada e entrará em contato em breve.\n\n` +
+        `📌 Você também pode agendar uma ligação online:\n` +
+        `<a href="https://agenda.bitrix24.site/meligue/">📅 Agendar Ligação (MeLigue)</a>\n\n` +
+        `<i>Aguarde nosso contato. Prioridade ALTA! ⚡</i>`
     );
+
   } catch (err) {
-    log.error(`Erro ao registrar atividade de chamada: ${err.message}`);
+    log.error(`[Chamada] Erro: ${err.message}`);
     await telegram.sendMessage(
       chatId,
-      `⚠️ No momento o sistema de registro de chamadas está em manutenção. ` +
-        `Por favor, entre em contato diretamente pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
+      `⚠️ Houve um problema. Por favor, entre em contato pelo telefone fixo: <b>${FALLBACK_PHONE}</b>`
     );
   }
 
@@ -758,11 +1612,79 @@ async function handleCallbackDetails(chatId, text, log) {
 }
 
 // =============================================================================
-// OPÇÃO 4: Falar com a Equipe (Transbordo / Handoff)
+// OPÇÃO 4: 2ª Via de Boleto Bancário (SPA 1130)
+// =============================================================================
+
+async function handleBoletoLookup(chatId, session, log) {
+  try {
+    await telegram.sendMessage(chatId, '💳 <b>2ª Via de Boleto Bancário</b>\n\nConsultando suas faturas...');
+
+    const contactId = session.crmContactId;
+    if (!contactId) {
+      await telegram.sendMessage(
+        chatId,
+        '❌ Não foi possível identificar seu cadastro para consultar faturas.\n\n' +
+          'Por favor, entre em contato pelo telefone fixo: <b>(65) 3052-5278</b>'
+      );
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    const faturas = await bitrix24.getFaturasByContact(contactId);
+    log.info(`[Boleto] ${faturas.length} faturas encontradas para contato ${contactId}`);
+
+    if (!faturas || faturas.length === 0) {
+      await telegram.sendMessage(
+        chatId,
+        'ℹ️ Não encontramos faturas vinculadas ao seu cadastro no momento.\n\n' +
+          'Se acredita que isso é um erro, entre em contato pelo telefone fixo: <b>(65) 3052-5278</b>'
+      );
+      updateSession(chatId, State.AUTHENTICATED);
+      await showMainMenu(chatId, getSession(chatId));
+      return;
+    }
+
+    // Limitar a 5 faturas para não exceder limite do Telegram
+    const faturasExibir = faturas.slice(0, 5);
+    const hasMore = faturas.length > 5;
+
+    // Cabeçalho
+    const header = `💳 <b>Suas Faturas</b> (${faturas.length} encontrada${faturas.length > 1 ? 's' : ''})\n` +
+      '━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+
+    // Montar corpo com todas as faturas
+    const body = faturasExibir
+      .map((fatura, i) => `<b>${i + 1}.</b>\n${bitrix24.formatFatura(fatura)}`)
+      .join('\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n');
+
+    const footer = hasMore
+      ? `\n<i>Mostrando 5 de ${faturas.length} faturas. Entre em contato para ver todas.</i>`
+      : '';
+
+    await telegram.sendMessage(chatId, header + body + footer);
+
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+
+  } catch (err) {
+    log.error(`[Boleto] Erro ao consultar faturas: ${err.message}`);
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ No momento o sistema de consulta de faturas está em manutenção.\n\n` +
+        `Por favor, entre em contato pelo telefone fixo: <b>(65) 3052-5278</b>`
+    );
+    updateSession(chatId, State.AUTHENTICATED);
+    await showMainMenu(chatId, getSession(chatId));
+  }
+}
+
+// =============================================================================
+// OPÇÃO 5: Falar com a Equipe (Transbordo / Handoff)
 // =============================================================================
 
 /**
- * Executa o protocolo de transbordo para a operadora Alice via Open Channels.
+ * Executa o protocolo de transbordo — notifica equipe via Bitrix24 IM.
  */
 async function handleHandoff(chatId, session, log) {
   try {
@@ -777,46 +1699,39 @@ async function handleHandoff(chatId, session, log) {
 
     const summary = await hermesAI.generateSummary(session.history || []);
 
-    // Whisper no Open Channel — usa BBCode (não HTML) para o Bitrix24 IM
-    const dialogId = `chat${chatId}`;
-    const whisperMessage = [
-      '[B]🤖 Resumo Hermes — Atendimento Telegram[/B]',
+    // Montar mensagem de notificação para a equipe
+    const clientName = session.name || 'Cliente não identificado';
+    const contactLink = session.crmContactId
+      ? `https://brandaocorrea.bitrix24.com.br/crm/contact/details/${session.crmContactId}/`
+      : 'Não disponível';
+
+    const notificationMsg = [
+      '[B]👩‍💼 SOLICITAÇÃO DE ATENDIMENTO HUMANO[/B]',
       '',
-      `[B]Cliente:[/B] ${session.name || 'Não identificado'}`,
+      `[B]Cliente:[/B] ${clientName}`,
       `[B]CPF:[/B] ${session.cpf || 'Não informado'}`,
       `[B]Telefone:[/B] ${session.phone || 'Não informado'}`,
+      `[B]Contato CRM:[/B] ${contactLink}`,
       '',
       '[B]📋 Resumo da conversa:[/B]',
       summary,
       '',
-      `[I]Gerado automaticamente pelo Hermes. ${new Date().toLocaleString('pt-BR')}[/I]`,
+      '[B]⚠️ Ação necessária:[/B] Responder o cliente pelo Telegram',
+      '',
+      `[I]Solicitação via bot Hermes. ${new Date().toLocaleString('pt-BR')}[/I]`,
     ].join('\n');
 
-    try {
-      await bitrix24.sendWhisperMessage({ dialogId, message: whisperMessage });
-    } catch (whisperErr) {
-      log.warn(`Whisper message falhou (continuando): ${whisperErr.message}`);
+    // Enviar para chat geral, Rodrigo e Larissa (1x cada)
+    const destinations = ['chat1', '1', '76239'];
+    for (const dialogId of destinations) {
+      try {
+        await bitrix24.sendBitrix24Message(dialogId, notificationMsg);
+      } catch (notifyErr) {
+        log.warn(`[Handoff] Falha ao notificar ${dialogId}: ${notifyErr.message}`);
+      }
     }
 
-    // Notificação BBCode para Alice
-    await bitrix24.notifyOperator({
-      operatorId: config.bitrix24.operatorAliceId,
-      clientName: session.name || 'Cliente não identificado',
-      clientCpf: session.cpf || undefined,
-      summary,
-    });
-
-    // Transferência automática — exige SESSION_ID (obtido via webhook Bitrix24)
-    // Se não temos sessionId, o operador atende manualmente após notificação.
-    try {
-      await bitrix24.assignChatToOperator({
-        chatId: dialogId,
-        sessionId: session.bxSessionId, // Pode ser undefined — fallback manual
-        operatorId: config.bitrix24.operatorAliceId,
-      });
-    } catch (transferErr) {
-      log.warn(`Transferência automática indisponível: ${transferErr.message}`);
-    }
+    log.info(`[Handoff] Notificação enviada para equipe Bitrix24`);
 
     await telegram.sendMessage(
       chatId,
@@ -827,13 +1742,13 @@ async function handleHandoff(chatId, session, log) {
         '<i>Obrigado pela paciência!</i>'
     );
 
-    appendHistory(chatId, 'system', 'Handoff para Alice concluído.');
+    appendHistory(chatId, 'system', 'Handoff para equipe concluído.');
   } catch (err) {
     log.error(`Erro no transbordo: ${err.message}`);
     await telegram.sendMessage(
       chatId,
       `⚠️ Encontramos uma dificuldade ao transferir seu atendimento. ` +
-        `Por favor, entre em contato diretamente pelo telefone/WhatsApp: <b>${FALLBACK_PHONE}</b>.`
+        `Por favor, entre em contato diretamente pelo telefone fixo: <b>${FALLBACK_PHONE}</b>.`
     );
   }
 }
@@ -852,12 +1767,42 @@ async function handleHandoffState(chatId, _text) {
 }
 
 // =============================================================================
+// HANDLER: /cancelar
+// =============================================================================
+
+async function handleCancel(chatId, firstName) {
+  const nome = firstName || 'Cliente';
+  
+  // Limpar sessão completamente
+  deleteSession(chatId);
+  
+  await telegram.sendMessage(
+    chatId,
+    `👋 Até logo, ${nome}!\n\n` +
+    `Obrigado por entrar em contato com o escritório <b>Brandão Corrêa</b>.\n\n` +
+    `Caso precise de algo novamente, é só enviar <b>/start</b> para ` +
+    `iniciar um novo atendimento.\n\n` +
+    `Desejamos um ótimo dia! 😊\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `<b>Brandão Corrêa Assessoria Jurídica</b>\n` +
+    `📞 (65) 3052-5278\n` +
+    `🌐 brandaocorrea.com.br`
+  );
+}
+
+// =============================================================================
 // HANDLER: /start
 // =============================================================================
 
 async function handleStart(chatId, firstName) {
+  // Limpar sessão completamente antes de recomeçar
   deleteSession(chatId);
-  getSession(chatId); // Cria nova sessão limpa
+  
+  // Aguardar um instante para garantir que sessão foi limpa
+  await new Promise(resolve => setTimeout(resolve, 100));
+  
+  // Criar nova sessão limpa e iniciar atendimento
+  getSession(chatId);
   await handleIdle(chatId, null, firstName);
 }
 

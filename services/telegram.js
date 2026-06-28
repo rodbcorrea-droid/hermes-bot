@@ -127,6 +127,75 @@ export async function sendInlineKeyboard(chatId, text, buttons, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// API: enviar foto
+// ---------------------------------------------------------------------------
+
+/**
+ * Envia uma foto para um chat.
+ * @param {number|string} chatId
+ * @param {string} fileId - file_id da foto no Telegram
+ * @param {string} [caption] - Legenda da foto
+ * @returns {Promise<object>}
+ */
+export async function sendPhoto(chatId, fileId, caption = '') {
+  const payload = {
+    chat_id: chatId,
+    photo: fileId,
+  };
+  if (caption) {
+    payload.caption = caption;
+    payload.parse_mode = 'HTML';
+  }
+  return tgCall('/sendPhoto', payload);
+}
+
+// ---------------------------------------------------------------------------
+// API: enviar documento
+// ---------------------------------------------------------------------------
+
+/**
+ * Envia um documento para um chat.
+ * @param {number|string} chatId
+ * @param {string} fileId - file_id do documento no Telegram
+ * @param {string} [caption] - Legenda do documento
+ * @returns {Promise<object>}
+ */
+export async function sendDocument(chatId, fileId, caption = '') {
+  const payload = {
+    chat_id: chatId,
+    document: fileId,
+  };
+  if (caption) {
+    payload.caption = caption;
+    payload.parse_mode = 'HTML';
+  }
+  return tgCall('/sendDocument', payload);
+}
+
+// ---------------------------------------------------------------------------
+// API: getFile — obter link de download de um arquivo do Telegram
+// ---------------------------------------------------------------------------
+
+/**
+ * Obtém o caminho de um arquivo no Telegram para download.
+ * @param {string} fileId - file_id do arquivo
+ * @returns {Promise<{file_path: string}>}
+ */
+export async function getFile(fileId) {
+  const resp = await tgCall('/getFile', { file_id: fileId });
+  return resp.result;
+}
+
+/**
+ * Monta a URL completa de download de um arquivo do Telegram.
+ * @param {string} filePath - file_path retornado pelo getFile
+ * @returns {string}
+ */
+export function getFileUrl(filePath) {
+  return `${config.telegram.apiBaseUrl}/file/${filePath}`;
+}
+
+// ---------------------------------------------------------------------------
 // API: responder callback_query
 // ---------------------------------------------------------------------------
 
@@ -267,13 +336,16 @@ export function extractPayload(body) {
     };
   }
 
-  // Mensagem normal (texto, contato, etc.)
+  // Mensagem normal (texto, contato, documento, foto, etc.)
   if (body.message) {
     const msg = body.message;
     return {
       chatId: msg.chat?.id ?? null,
       text: msg.text || null,
       contact: msg.contact || null,
+      document: msg.document || null,
+      photo: msg.photo || null,
+      caption: msg.caption || null,
       callbackQueryId: null,
       callbackData: null,
       messageId: msg.message_id || null,

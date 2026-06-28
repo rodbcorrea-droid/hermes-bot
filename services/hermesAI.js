@@ -23,6 +23,7 @@ export const Intent = Object.freeze({
   DUVIDA_COMPLEXA: 'DUVIDA_COMPLEXA',
   OUTRO: 'OUTRO',
   MENU_PRINCIPAL: 'MENU_PRINCIPAL',
+  BOLETO: 'BOLETO',
 });
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,7 @@ const INTENT_LABELS = {
   [Intent.AGENDAMENTO]: 'Agendamento de Horário',
   [Intent.SOLICITAR_CHAMADA]: 'Solicitar uma Chamada',
   [Intent.FALAR_EQUIPE]: 'Falar com a Equipe',
+  [Intent.BOLETO]: '2ª Via de Boleto',
 };
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,7 @@ Intenções possíveis:
 - FORNECER_CPF: Cliente está enviando um número de CPF (formato XXX.XXX.XXX-XX ou apenas dígitos).
 - MENU_PRINCIPAL: Cliente quer voltar ao menu principal ou ver as opções.
 - DUVIDA_COMPLEXA: Pergunta técnica jurídica ou dúvida complexa que precisa de humano.
+- BOLETO: Cliente quer 2ª via de boleto, fatura, pagamento, cobrança ou invoice.
 - OUTRO: Nenhuma das anteriores.
 
 Regras:
@@ -312,6 +315,17 @@ export function regexClassify(message) {
       intent: Intent.SOLICITAR_CHAMADA,
       confidence: 0.85,
       reasoning: 'Cliente solicitou chamada telefônica.',
+    };
+  }
+
+  // 2ª via de boleto / fatura / pagamento
+  const boletoPattern =
+    /(boleto|2ª via|2a via|segunda via|fatura|pagamento|pagar|cobrança|cobranca|invoice|pix)/;
+  if (boletoPattern.test(msg)) {
+    return {
+      intent: Intent.BOLETO,
+      confidence: 0.85,
+      reasoning: 'Cliente solicitou 2ª via de boleto ou informações de pagamento.',
     };
   }
 

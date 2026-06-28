@@ -127,7 +127,7 @@ const config = Object.freeze({
 
   // -- Contingência
   fallback: {
-    phone: optional('FALLBACK_PHONE', '(65) 99679-4931'),
+    phone: optional('FALLBACK_PHONE', '(65) 3052-5278'),
   },
 });
 
